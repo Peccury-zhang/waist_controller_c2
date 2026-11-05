@@ -1,0 +1,84 @@
+{
+  "Source": "报错逻辑&故障代码V1.3.xlsx",
+  "Sheet": "ZYR120&120MAX报错逻辑",
+  "Entries": [
+    {
+      "Code": 2,
+      "Name": "欠压",
+      "ClearMethod": "重启清除",
+      "Row": 2
+    },
+    {
+      "Code": 1,
+      "Name": "过压",
+      "ClearMethod": "重启清除",
+      "Row": 3
+    },
+    {
+      "Code": 4,
+      "Name": "过温",
+      "ClearMethod": "恢复到85°以下指令清除",
+      "Row": 4
+    },
+    {
+      "Code": 8,
+      "Name": "堵转",
+      "ClearMethod": "重启清除",
+      "Row": 5
+    },
+    {
+      "Code": 16,
+      "Name": "过载",
+      "ClearMethod": "重启清除",
+      "Row": 6
+    },
+    {
+      "Code": 32,
+      "Name": "速度跟踪误差过大",
+      "ClearMethod": "重启清除",
+      "Row": 7
+    },
+    {
+      "Code": 64,
+      "Name": "正限位保护",
+      "ClearMethod": "指令清除，向限位反方向可以运行",
+      "Row": 8
+    },
+    {
+      "Code": 128,
+      "Name": "负限位保护",
+      "ClearMethod": "指令清除，向限位反方向可以运行",
+      "Row": 9
+    },
+    {
+      "Code": 256,
+      "Name": "输出端编码器异常",
+      "ClearMethod": "重启清除",
+      "Row": 10
+    },
+    {
+      "Code": 512,
+      "Name": "位置跃迁过大",
+      "ClearMethod": "指令清除",
+      "Row": 11
+    },
+    {
+      "Code": 1024,
+      "Name": "电流采样错误",
+      "ClearMethod": "重启清除",
+      "Row": 12
+    },
+    {
+      "Code": 2048,
+      "Name": "电流跟踪误差超差",
+      "ClearMethod": "重启清除",
+      "Row": 13
+    },
+    {
+      "Code": 4096,
+      "Name": "位置跟踪误差过大",
+      "ClearMethod": "重启清除",
+      "Row": 14
+    }
+  ]
+}

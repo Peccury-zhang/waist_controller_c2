@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="waist_motor_controller.csproj" />
+  <Project Path="../waist_motor_controller.Tests/waist_motor_controller.Tests.csproj" />
+</Solution>

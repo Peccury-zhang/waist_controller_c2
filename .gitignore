@@ -1,0 +1,30 @@
+# ================= 编译生成 =================
+# 编译输出（exe/dll/pdb/runtimeconfig.json/deps.json 及复制到输出目录的 ControlCANFD.dll）
+[Bb]in/
+# 编译中间产物（project.assets.json、nuget 缓存、生成的 AssemblyInfo 等）
+[Oo]bj/
+
+# ================= Visual Studio / IDE 生成 =================
+# VS 本地缓存（ProjectEvaluation、slnx 缓存、DesignTimeBuild 等）
+.vs/
+# 每机的用户级工程设置（启动项、调试选项等）
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+# JetBrains Rider / VS Code 本地目录（如使用）
+.idea/
+.vscode/
+
+# ================= 其它临时产物 =================
+*.log
+*.tmp
+[Dd]esign[Tt]ime[B]uild/
+tmp/
+release/
+
+# 注意：native/ControlCANFD.dll 为第三方运行时依赖（非编译生成），
+# 是仓库内唯一来源，必须随仓库提交，勿忽略。
+
+release-*/
+docs/
