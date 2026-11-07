@@ -19,7 +19,6 @@ public static class FeedbackParser
                 FaultCode = f.ReadBeU16(6), TemperatureRaw = f.ReadBe16(8), Mode = f.Data[10],
                 Enabled = (st & 0x80) != 0, BrakeReleased = (st & 0x40) != 0, HasError = (st & 0x20) != 0,
                 TargetReached = (st & 0x10) != 0,
-                Timestamp = Environment.TickCount64,
             };
         }
         byte status = f.Data[6];
@@ -30,7 +29,7 @@ public static class FeedbackParser
             Mode = (byte)((status >> 6) & 3), Enabled = (status & 0x20) != 0,
             BrakeReleased = (status & 0x10) != 0, HasError = (status & 0x08) != 0,
             FaultCode = (ushort)(f.Data[7] | (f.Data[8] << 8)),
-            TemperatureRaw = f.ReadBe16(9), Timestamp = Environment.TickCount64,
+            TemperatureRaw = f.ReadBe16(9),
         };
     }
 }

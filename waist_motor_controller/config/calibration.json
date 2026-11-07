@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 2,
+  "angleUnit": "deg",
+  "angleConvention": "joint_control_display",
+  "motors": [
+    {
+      "logicalId": 1,
+      "minAngleDeg": -172,
+      "maxAngleDeg": 172
+    },
+    {
+      "logicalId": 2,
+      "minAngleDeg": -100,
+      "maxAngleDeg": 15
+    },
+    {
+      "logicalId": 3,
+      "minAngleDeg": -10,
+      "maxAngleDeg": 143
+    },
+    {
+      "logicalId": 4,
+      "minAngleDeg": -54,
+      "maxAngleDeg": 10
+    }
+  ],
+  "taskLimits": {
+    "referenceFrame": "base_link",
+    "controlledLink": "bady_link_4",
+    "distanceUnit": "m",
+    "forwardLimit": 0.35,
+    "backwardLimit": 0.5
+  }
+}

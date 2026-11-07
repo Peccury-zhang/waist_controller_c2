@@ -11,6 +11,8 @@ public sealed partial class MainForm
         TextMain = UiTheme.Text, TextSub = UiTheme.Muted;
     private enum BtnKind { Normal, Primary, Success, Warning, Danger, SoftDanger, SoftOrange }
     private readonly SurfacePanel[] _motorCards = new SurfacePanel[4];
+    private readonly Label[] _motorCardTitles = new Label[4];
+    private static readonly string[] JointDisplayNames = { "上部旋转", "折叠腿高", "折叠腿中", "折叠腿低" };
     private readonly ToolTip _tips = new() { ShowAlways = true, InitialDelay = 350, ReshowDelay = 100 };
     private Label _motionHint = null!;
     private Button _saveMappingButton = null!;
@@ -38,6 +40,28 @@ public sealed partial class MainForm
             BorderStyle = BorderStyle.None, TextAlign = HorizontalAlignment.Center,
             Margin = Padding.Empty,
         };
+
+    private Button CreateReturnAllZeroButton()
+    {
+        var button = NewButton("全部回零位", kind: BtnKind.Primary);
+        button.Dock = DockStyle.Fill;
+        button.Click += (_, _) => RunMotorOp("全部回零位",
+            () => _controller.ReturnAllToZero(JogAccel, PpProfileSpeed));
+        _tips.SetToolTip(button, "仅让已通过本程序使能的映射关节回到 0°，未使能关节自动跳过。使用关节控制页的轨迹速度和加速度。");
+        return button;
+    }
+
+    private ActionButton CreateEmergencyStopButton()
+    {
+        var button = (ActionButton)NewButton("■  急停 · 4 台电机", kind: BtnKind.Danger);
+        button.Dock = DockStyle.Fill;
+        button.Click += (_, _) =>
+        {
+            _wholeBodyPage?.PrepareEmergencyStop();
+            RunMotorOp("急停", _controller.EmergencyStop);
+        };
+        return button;
+    }
 
     private static Label Caption(string text, float size = 10.5F)
         => new() { Text = text, AutoSize = true, ForeColor = TextSub, BackColor = Color.Transparent,
@@ -72,15 +96,16 @@ public sealed partial class MainForm
 
     private sealed class SectionCard : SurfacePanel
     {
+        public Panel Header { get; }
         public Panel Content { get; }
         public SectionCard(string title, int height)
         {
             Height = height; Dock = DockStyle.Fill; Margin = new Padding(0, 0, 0, 16);
-            var header = new BufferedPanel { Dock = DockStyle.Top, Height = 48, BackColor = Color.Transparent };
-            header.Controls.Add(new Label { Text = title, AutoSize = true, Location = new Point(20, 13),
+            Header = new BufferedPanel { Dock = DockStyle.Top, Height = 48, BackColor = Color.Transparent };
+            Header.Controls.Add(new Label { Text = title, AutoSize = true, Location = new Point(20, 13),
                 Font = UiTheme.Font(13, FontStyle.Bold), ForeColor = TextMain, BackColor = Color.Transparent });
             Content = new BufferedPanel { Dock = DockStyle.Fill, Padding = new Padding(20, 4, 20, 18), BackColor = Color.Transparent };
-            Controls.Add(Content); Controls.Add(header);
+            Controls.Add(Content); Controls.Add(Header);
         }
     }
 
@@ -120,20 +145,10 @@ public sealed partial class MainForm
     private void BuildUi()
     {
         _motorCombo = new JointComboBox { DropDownStyle = ComboBoxStyle.DropDownList, FlatStyle = FlatStyle.Flat,
-            Font = UiTheme.Font(13, FontStyle.Bold), BackColor = TileColor, ForeColor = TextMain,
+            Font = UiTheme.Font(11.5F, FontStyle.Bold), BackColor = TileColor, ForeColor = TextMain,
             Dock = DockStyle.Fill, Margin = new Padding(0, 3, 0, 0) };
-        foreach (var m in _registry.Motors) _motorCombo.Items.Add(m.Name);
+        for (int i = 0; i < _registry.Motors.Count; i++) _motorCombo.Items.Add(MotorDisplayName(i));
         _motorCombo.DrawMode = DrawMode.OwnerDrawFixed;
-        _motorCombo.ItemHeight = 32;
-        _motorCombo.DrawItem += (_, e) =>
-        {
-            if (e.Index < 0) return;
-            bool selected = (e.State & DrawItemState.Selected) != 0;
-            using var fill = new SolidBrush(selected ? Color.FromArgb(42, 78, 120) : TileColor);
-            e.Graphics.FillRectangle(fill, e.Bounds);
-            TextRenderer.DrawText(e.Graphics, _motorCombo.Items[e.Index]?.ToString() ?? "", _motorCombo.Font,
-                Rectangle.Inflate(e.Bounds, -12, 0), TextMain, TextFormatFlags.VerticalCenter | TextFormatFlags.Left);
-        };
         _motorCombo.SelectedIndex = 0;
 
         var root = Grid(1, 2);
@@ -156,11 +171,12 @@ public sealed partial class MainForm
 
         var connection = Grid(1, 2); connection.BackColor = BgColor;
         connection.RowStyles.Clear();
-        connection.RowStyles.Add(new RowStyle(SizeType.Absolute, 202));
+        connection.RowStyles.Add(new RowStyle(SizeType.Absolute, 262));
         connection.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         connection.Controls.Add(BuildConnSection(), 0, 0);
-        var log = BuildLogSection(); log.Margin = Padding.Empty;
-        connection.Controls.Add(log, 0, 1);
+        var logHost = new BufferedPanel { Dock = DockStyle.Fill, BackColor = BgColor, Margin = Padding.Empty };
+        BuildLogSection(logHost);
+        connection.Controls.Add(logHost, 0, 1);
         _pages[0] = CreatePage(connection, 438);
 
         var workspace = Grid(2, 1);
@@ -173,15 +189,23 @@ public sealed partial class MainForm
         var control = BuildMotorSection(); control.Margin = Padding.Empty;
         workspace.Controls.Add(control, 1, 0);
         _pages[1] = CreatePage(workspace, 816);
-        for (int i = 2; i < _pages.Length; i++)
+        try
         {
-            var placeholder = new SectionCard(titles[i], 200) { Margin = Padding.Empty };
-            var label = Caption("功能待开发", 12); label.AutoSize = false;
-            label.Dock = DockStyle.Fill; label.TextAlign = ContentAlignment.MiddleCenter;
-            placeholder.Content.Controls.Add(label);
-            var layout = Grid(1, 1); layout.BackColor = BgColor; layout.Controls.Add(placeholder);
-            _pages[i] = CreatePage(layout, 200);
+            _wholeBodyPage = new waist_motor_controller.WholeBody.WholeBodyPage(_transport, _registry, _controller,
+                () => new Dictionary<int, string>(_firmware), OnLogFromThread);
+            _pages[2] = new BufferedPanel { Dock = DockStyle.Fill, BackColor = BgColor };
+            _pages[2].Controls.Add(_wholeBodyPage);
         }
+        catch (Exception ex)
+        {
+            _pages[2] = new Panel { Dock = DockStyle.Fill };
+            _pages[2].Controls.Add(new Label { Dock = DockStyle.Fill, Text = "Whole body model unavailable: " + ex.Message, ForeColor = TextMain });
+        }
+        var calibrationPage = new waist_motor_controller.WholeBody.CalibrationPage(new WaistModel.CalibrationStore(),
+            () => _wholeBodyPage?.Busy == true || _registry.Motors.Any(m => _controller.IsJogging(m.DeviceId) || _controller.IsBusy(m.DeviceId)),
+            () => _registry.Motors.Select(m => m.Direction).ToArray());
+        calibrationPage.Saved += () => _wholeBodyPage?.CalibrationChanged();
+        _pages[3] = new BufferedPanel { Dock = DockStyle.Fill, AutoScroll = true }; _pages[3].Controls.Add(calibrationPage);
         foreach (var page in _pages) { page.Visible = false; host.Controls.Add(page); }
         _pageTransition = new PageTransition(); host.Controls.Add(_pageTransition);
         Controls.Add(root);
@@ -189,6 +213,7 @@ public sealed partial class MainForm
         _motorCombo.SelectedIndexChanged += (_, _) =>
         {
             UpdateMotorSelection();
+            UpdateDirectionUi();
             if (_uiTimer != null) RefreshStatus();
         };
         UpdateMotorSelection();
@@ -246,8 +271,8 @@ public sealed partial class MainForm
 
     private SectionCard BuildConnSection()
     {
-        var card = new SectionCard("通信连接", 186);
-        var grid = Grid(4, 2);
+        var card = new SectionCard("通信连接", 246);
+        var grid = Grid(4, 3);
         grid.RowStyles.Clear();
         var connection = new Tile("连接状态", "● 未连接");
         _connStateLabel = connection.ValueLabel; _connStateLabel.Font = UiTheme.Font(13, FontStyle.Bold);
@@ -257,8 +282,11 @@ public sealed partial class MainForm
         _rxTxLabel = traffic.ValueLabel; _rxTxLabel.Font = UiTheme.Font(11.5F, FontStyle.Bold);
         var speed = new Tile("通信速率", "1M / 5M · CANFD");
         speed.ValueLabel.Font = UiTheme.Font(10.5F, FontStyle.Bold);
+        var adapter = new Tile("适配器信息", "USBCANFD-200U  ·  标准帧 · BRS  ·  终端电阻：开启");
+        adapter.ValueLabel.Font = UiTheme.Font(10.5F, FontStyle.Bold);
         grid.Controls.Add(connection, 0, 0); grid.Controls.Add(nodes, 1, 0);
         grid.Controls.Add(traffic, 2, 0); grid.Controls.Add(speed, 3, 0);
+        grid.Controls.Add(adapter, 0, 1); grid.SetColumnSpan(adapter, 4);
 
         var operations = Grid(2, 1);
         _openCloseButton = NewButton("打开设备", 140, 52, BtnKind.Primary);
@@ -267,11 +295,28 @@ public sealed partial class MainForm
         _changeIdButton.Click += (_, _) => OnChangeId();
         var connectionButtons = new[] { _openCloseButton, _changeIdButton };
         for (int i = 0; i < connectionButtons.Length; i++) { connectionButtons[i].Dock = DockStyle.Fill; operations.Controls.Add(connectionButtons[i], i, 0); }
-        grid.Controls.Add(operations, 0, 1); grid.SetColumnSpan(operations, 4);
+        grid.Controls.Add(operations, 0, 2); grid.SetColumnSpan(operations, 4);
         grid.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        grid.RowStyles.Add(new RowStyle(SizeType.Absolute, 60));
         grid.RowStyles.Add(new RowStyle(SizeType.Absolute, 52));
         card.Content.Controls.Add(grid);
         return card;
+    }
+
+    private string MotorDisplayName(int index)
+        => $"{_registry.Motors[index].DeviceId}号电机-{JointDisplayNames[index]}";
+
+    private void RefreshMotorDisplayNames()
+    {
+        int selectedIndex = _motorCombo.SelectedIndex;
+        for (int i = 0; i < _motorCardTitles.Length; i++)
+        {
+            string name = MotorDisplayName(i);
+            _motorCardTitles[i].Text = name;
+            if (!Equals(_motorCombo.Items[i], name)) _motorCombo.Items[i] = name;
+        }
+        _motorCombo.SelectedIndex = selectedIndex;
+        _motorCombo.Invalidate();
     }
 
     private SectionCard BuildMappingSection()
@@ -286,15 +331,17 @@ public sealed partial class MainForm
             var tile = new SurfacePanel { Dock = DockStyle.Fill, Margin = new Padding(0, 0, 0, 10),
                 Padding = new Padding(13, 10, 13, 10), Cursor = Cursors.Hand };
             _motorCards[i] = tile;
-            var name = new Label { Text = $"{i + 1:00}   {motor.Name}", ForeColor = TextMain,
+            var name = new Label { Text = MotorDisplayName(i), ForeColor = TextMain,
                 Font = UiTheme.Font(11.5F, FontStyle.Bold), Dock = DockStyle.Top, Height = 31,
                 BackColor = Color.Transparent, AutoEllipsis = true };
+            _motorCardTitles[i] = name;
             var bottom = new BufferedFlowLayoutPanel { Dock = DockStyle.Bottom, Height = 31, WrapContents = false, Margin = Padding.Empty, BackColor = Color.Transparent };
-            var id = Caption("ID"); id.Margin = new Padding(0, 5, 8, 0);
+            var id = Caption("ID"); id.Anchor = AnchorStyles.Left; id.Margin = new Padding(0, 0, 8, 0);
             _idNums[i] = NewNum(1, 127, motor.DeviceId, 58);
             _idNums[i].Font = UiTheme.Font(12);
             _onlineLabels[i] = Caption("● 离线", 10.5F);
-            _onlineLabels[i].Margin = new Padding(18, 5, 0, 0);
+            _onlineLabels[i].Anchor = AnchorStyles.Left;
+            _onlineLabels[i].Margin = new Padding(18, 0, 0, 0);
             bottom.Controls.AddRange(new System.Windows.Forms.Control[] { id, _idNums[i], _onlineLabels[i] });
             tile.Controls.Add(bottom); tile.Controls.Add(name);
             tile.Click += (_, _) => _motorCombo.SelectedIndex = index;
@@ -307,7 +354,7 @@ public sealed partial class MainForm
             tile.MouseLeave += (_, _) => UpdateMotorSelection();
             _tips.SetToolTip(tile, $"{motor.Model} · 点击选择此关节");
             content.Controls.Add(tile, 0, i);
-            content.RowStyles.Add(new RowStyle(SizeType.Absolute, 98));
+            content.RowStyles.Add(new RowStyle(SizeType.Absolute, 93));
         }
         var save = NewButton("保存映射与参数", 210, 52);
         _saveMappingButton = save;
@@ -321,20 +368,15 @@ public sealed partial class MainForm
         version.Controls.Add(_firmwareLabel);
         version.Controls.Add(versionTitle);
         content.Controls.Add(version, 0, 5); content.RowStyles.Add(new RowStyle(SizeType.Absolute, 88));
-        _returnAllZeroButton = NewButton("全部回零位", kind: BtnKind.Primary);
-        _returnAllZeroButton.Dock = DockStyle.Fill;
+        _returnAllZeroButton = CreateReturnAllZeroButton();
         _returnAllZeroButton.Margin = new Padding(0, 16, 0, 0);
-        _returnAllZeroButton.Click += (_, _) => RunMotorOp("全部回零位",
-            () => _controller.ReturnAllToZero(JogAccel, PpProfileSpeed));
-        _tips.SetToolTip(_returnAllZeroButton, "仅让已通过本程序使能的映射关节回到 0°，未使能关节自动跳过。使用右侧轨迹速度和加速度。");
         content.Controls.Add(_returnAllZeroButton, 0, 6); content.RowStyles.Add(new RowStyle(SizeType.Absolute, 72));
         _enableAllButton = NewButton("全部使能", kind: BtnKind.Primary);
         _enableAllButton.Dock = DockStyle.Fill; _enableAllButton.Margin = new Padding(0, 10, 0, 0);
         _enableAllButton.Click += (_, _) => RunMotorOp("全部使能", () => _controller.EnableAll(JogAccel, PpProfileSpeed));
         content.Controls.Add(_enableAllButton, 0, 7); content.RowStyles.Add(new RowStyle(SizeType.Absolute, 66));
-        _eStopButton = NewButton("■  急停 · 4 台电机", kind: BtnKind.Danger);
-        _eStopButton.Dock = DockStyle.Fill; _eStopButton.Margin = new Padding(0, 10, 0, 0);
-        _eStopButton.Click += (_, _) => RunMotorOp("急停", () => _controller.EmergencyStop());
+        _eStopButton = CreateEmergencyStopButton();
+        _eStopButton.Margin = new Padding(0, 10, 0, 0);
         content.Controls.Add(_eStopButton, 0, 8); content.RowStyles.Add(new RowStyle(SizeType.Absolute, 66));
         content.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         card.Content.Controls.Add(content);
@@ -346,16 +388,36 @@ public sealed partial class MainForm
         var card = new SectionCard("单关节控制", 684);
         var grid = Grid(1, 8);
         grid.RowStyles.Clear();
-        var select = Grid(2, 1);
-        select.ColumnStyles.Clear(); select.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 56)); select.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 44));
-        select.Controls.Add(_motorCombo, 0, 0);
-        var units = Caption("轨迹参数及角度：关节输出端", 10);
-        units.Dock = DockStyle.Fill; units.TextAlign = ContentAlignment.MiddleRight; units.AutoSize = false;
-        select.Controls.Add(units, 1, 0);
-        grid.Controls.Add(select, 0, 0); grid.RowStyles.Add(new RowStyle(SizeType.Absolute, 52));
+        var select = Grid(4, 1);
+        select.MaximumSize = new Size(465, 0);
+        select.ColumnStyles.Clear();
+        select.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        select.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        select.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        select.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 76));
+        var joint = Caption("关节选择：", 10);
+        joint.Anchor = AnchorStyles.Left;
+        joint.Margin = new Padding(0, 0, 8, 8);
+        select.Controls.Add(joint, 0, 0);
+        _motorCombo.Margin = new Padding(0, 3, 12, 0);
+        select.Controls.Add(_motorCombo, 1, 0);
+        var direction = Caption("方向系数：", 10);
+        direction.Anchor = AnchorStyles.Left;
+        direction.Margin = new Padding(0, 0, 8, 8);
+        select.Controls.Add(direction, 2, 0);
+        _directionCombo = new JointComboBox { AccessibleName = "方向系数", Dock = DockStyle.Fill,
+            Font = UiTheme.Font(13, FontStyle.Bold), Margin = new Padding(0, 3, 8, 0) };
+        _directionCombo.Items.AddRange(new object[] { "+", "−" });
+        _directionCombo.SelectionChangeCommitted += (_, _) =>
+        {
+            if (!_transport.IsOpen) _pendingDirections[CurrentLogicalIndex] = _directionCombo.SelectedIndex == 0 ? 1 : -1;
+        };
+        _tips.SetToolTip(_directionCombo, "关闭设备后可修改方向系数，点击“保存映射与参数”生效。");
+        select.Controls.Add(_directionCombo, 3, 0);
+        grid.Controls.Add(select, 0, 0); grid.RowStyles.Add(new RowStyle(SizeType.Absolute, 60));
 
         var metrics = Grid(3, 2);
-        var pos = new Tile("当前位置 · 输出端"); _posLabel = pos.ValueLabel; _posLabel.ForeColor = UiTheme.ValueBlue;
+        var pos = new Tile("当前位置 · 关节角"); _posLabel = pos.ValueLabel; _posLabel.ForeColor = UiTheme.ValueBlue;
         var velocity = new Tile("当前速度 · 输入端"); _velLabel = velocity.ValueLabel;
         var current = new Tile("电流"); _curLabel = current.ValueLabel;
         var mode = new Tile("控制模式"); _modeLabel = mode.ValueLabel; _modeLabel.Font = UiTheme.Font(13, FontStyle.Bold);
@@ -405,7 +467,7 @@ public sealed partial class MainForm
         var absolute = Grid(2, 1);
         _moveButton = NewButton("运行到指定角度", kind: BtnKind.Primary);
         _moveButton.Dock = DockStyle.Fill; _moveButton.Margin = new Padding(0, 0, 12, 8);
-        _moveButton.Click += (_, _) => RunMotionOp("角度定位", () => _controller.MoveToPosition(CurrentDeviceId, (double)_targetAngleNum.Value, JogAccel, PpProfileSpeed));
+        _moveButton.Click += (_, _) => RunMotionOp("角度定位", () => _controller.MoveToJointPosition(CurrentDeviceId, (double)_targetAngleNum.Value, JogAccel, PpProfileSpeed));
         _returnZeroButton = NewButton("运行回零位");
         _returnZeroButton.Dock = DockStyle.Fill; _returnZeroButton.Margin = new Padding(0, 0, 12, 8);
         _returnZeroButton.Click += (_, _) => RunMotionOp("当前关节回零", () => _controller.MoveToPosition(CurrentDeviceId, 0, JogAccel, PpProfileSpeed));
@@ -421,8 +483,8 @@ public sealed partial class MainForm
         jog.Controls.Add(NumberField("点动增量 · °", _jogStepNum), 0, 0);
         _jogRevButton = NewButton("−  点动"); _jogFwdButton = NewButton("+  点动");
         _stopMotionButton = NewButton("■  停止 / 保持", kind: BtnKind.Warning);
-        _jogRevButton.Click += (_, _) => RunMotionOp("负向增量", () => _controller.MoveIncrement(CurrentDeviceId, -(double)_jogStepNum.Value, JogAccel, PpProfileSpeed));
-        _jogFwdButton.Click += (_, _) => RunMotionOp("正向增量", () => _controller.MoveIncrement(CurrentDeviceId, (double)_jogStepNum.Value, JogAccel, PpProfileSpeed));
+        _jogRevButton.Click += (_, _) => RunMotionOp("负向增量", () => _controller.MoveJointIncrement(CurrentDeviceId, -(double)_jogStepNum.Value, JogAccel, PpProfileSpeed));
+        _jogFwdButton.Click += (_, _) => RunMotionOp("正向增量", () => _controller.MoveJointIncrement(CurrentDeviceId, (double)_jogStepNum.Value, JogAccel, PpProfileSpeed));
         _stopMotionButton.Click += (_, _) => RunMotorOp("停止", () => _controller.StopMotion(CurrentDeviceId));
         var jogButtons = new[] { _jogRevButton, _jogFwdButton, _stopMotionButton };
         for (int i = 0; i < 3; i++) { jogButtons[i].Dock = DockStyle.Fill; jogButtons[i].Margin = new Padding(0, 27, i == 2 ? 0 : 10, 8); jog.Controls.Add(jogButtons[i], i + 1, 0); }
@@ -437,26 +499,60 @@ public sealed partial class MainForm
         return card;
     }
 
-    private SectionCard BuildLogSection()
+    private void BuildLogSection(Panel host)
     {
-        var card = new SectionCard("通信日志", 204);
-        var grid = Grid(2, 1);
-        grid.ColumnStyles.Clear(); grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100)); grid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 156));
+        var card = new SectionCard("通信日志", 48) { Dock = DockStyle.Top, Margin = Padding.Empty };
+        var toggle = NewButton("显示日志  ▾", 108, 34);
+        toggle.Name = "ToggleLogButton";
+        toggle.Location = new Point(112, 7);
+        toggle.Font = UiTheme.Font(10.5F, FontStyle.Bold);
+        var clear = NewButton("清空日志", 100, 34);
+        clear.Name = "ClearLogButton";
+        clear.Location = new Point(228, 7);
+        clear.Font = toggle.Font;
+        card.Header.Controls.AddRange(new System.Windows.Forms.Control[] { toggle, clear });
+
         _logBox = new TextBox { Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical, WordWrap = false,
             Dock = DockStyle.Fill, Font = new Font("Consolas", 10), BackColor = BgColor, ForeColor = TextSub,
             BorderStyle = BorderStyle.None, Margin = new Padding(12) };
         var logSurface = new SurfacePanel { Dock = DockStyle.Fill, FillColor = BgColor, BackColor = BgColor,
-            Padding = new Padding(12), Margin = new Padding(0, 0, 16, 0) };
+            Padding = new Padding(12), Margin = Padding.Empty };
         logSurface.Controls.Add(_logBox);
-        grid.Controls.Add(logSurface, 0, 0);
-        var actions = Grid(1, 2);
-        actions.RowStyles.Clear();
-        var clear = NewButton("清空显示", 145, 50); clear.Dock = DockStyle.Top; clear.Margin = Padding.Empty;
+        card.Content.Controls.Add(logSurface);
+        card.Content.Visible = false;
         clear.Click += (_, _) => _logBox.Clear();
-        actions.Controls.Add(clear, 0, 0); actions.RowStyles.Add(new RowStyle(SizeType.Absolute, 62));
-        var note = Caption("USBCANFD-200U\n标准帧 · BRS\n终端电阻：开启", 9.5F); note.AutoSize = false; note.Dock = DockStyle.Fill;
-        actions.Controls.Add(note, 0, 1); actions.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        grid.Controls.Add(actions, 1, 0); card.Content.Controls.Add(grid);
-        return card;
+
+        bool expanded = false;
+        double reveal = 0, start = 0;
+        var clock = new System.Diagnostics.Stopwatch();
+        var animation = new System.Windows.Forms.Timer { Interval = 15 };
+        void ResizeCard()
+        {
+            int headerHeight = card.Header.Height;
+            card.Height = headerHeight + (int)Math.Round(reveal * Math.Max(0, host.ClientSize.Height - headerHeight));
+        }
+        animation.Tick += (_, _) =>
+        {
+            double progress = Math.Clamp(clock.Elapsed.TotalMilliseconds / 200, 0, 1);
+            double eased = progress * progress * (3 - 2 * progress);
+            reveal = start + ((expanded ? 1 : 0) - start) * eased;
+            ResizeCard();
+            if (progress < 1) return;
+            animation.Stop();
+            card.Content.Visible = expanded;
+        };
+        toggle.Click += (_, _) =>
+        {
+            expanded = !expanded;
+            toggle.Text = expanded ? "收起日志  ▴" : "显示日志  ▾";
+            if (expanded) card.Content.Visible = true;
+            start = reveal;
+            clock.Restart();
+            animation.Start();
+        };
+        host.Controls.Add(card);
+        host.SizeChanged += (_, _) => ResizeCard();
+        card.Header.SizeChanged += (_, _) => ResizeCard();
+        card.Disposed += (_, _) => animation.Dispose();
     }
 }

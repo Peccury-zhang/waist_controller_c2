@@ -14,9 +14,11 @@ internal sealed class WindowTitleBar : Panel
         _form = form;
         Name = "WindowTitleBar"; Dock = DockStyle.Top; Height = 52;
         BackColor = UiTheme.Background; DoubleBuffered = true;
-        _title = new Label { Text = form.Text, Font = UiTheme.Font(13, FontStyle.Bold), ForeColor = Color.White,
+        _title = new CaptionLabel { Text = form.Text, Font = UiTheme.Font(13, FontStyle.Bold), ForeColor = Color.White,
             TextAlign = ContentAlignment.MiddleLeft, AutoEllipsis = true };
-        _logo = new PictureBox { Image = form.Icon?.ToBitmap(), SizeMode = PictureBoxSizeMode.Zoom };
+        using var logoStream = typeof(WindowTitleBar).Assembly.GetManifestResourceStream("waist_motor_controller.yclab2_orange.png");
+        using var logo = logoStream == null ? null : Image.FromStream(logoStream);
+        _logo = new CaptionLogo { Image = logo == null ? form.Icon?.ToBitmap() : new Bitmap(logo), SizeMode = PictureBoxSizeMode.Zoom };
         _actions = new FlowLayoutPanel { FlowDirection = FlowDirection.LeftToRight, WrapContents = false,
             Margin = Padding.Empty, Padding = Padding.Empty };
         var minimize = new CaptionButton(0) { AccessibleName = "最小化" };
@@ -32,12 +34,40 @@ internal sealed class WindowTitleBar : Panel
 
     private void UpdateTitle(object? sender, EventArgs e) => _title.Text = _form.Text;
 
+    // Child HWNDs otherwise consume WM_NCHITTEST before MainForm sees it.
+    // HTTRANSPARENT lets Windows continue hit testing on the parent, preserving
+    // native move, double-click maximize, right-click menu and top-edge resizing.
+    // The action buttons remain ordinary client controls.
+    protected override void WndProc(ref Message m)
+    {
+        if (m.Msg == 0x84) { m.Result = -1; return; }
+        base.WndProc(ref m);
+    }
+
+    private sealed class CaptionLabel : Label
+    {
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == 0x84) { m.Result = -1; return; }
+            base.WndProc(ref m);
+        }
+    }
+
+    private sealed class CaptionLogo : PictureBox
+    {
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == 0x84) { m.Result = -1; return; }
+            base.WndProc(ref m);
+        }
+    }
+
     protected override void OnLayout(LayoutEventArgs e)
     {
         base.OnLayout(e);
         if (_logo == null) return;
         float scale = DeviceDpi / 96f;
-        int logoSize = (int)(40 * scale), inset = (int)(12 * scale), buttonWidth = (int)(46 * scale);
+        int logoSize = (int)(48 * scale), inset = (int)(12 * scale), buttonWidth = (int)(46 * scale);
         _logo.SetBounds(inset, (Height - logoSize) / 2, logoSize, logoSize);
         _actions.SetBounds(Width - buttonWidth * 3, 0, buttonWidth * 3, Height);
         foreach (System.Windows.Forms.Control button in _actions.Controls) button.Size = new Size(buttonWidth, Height);

@@ -1,4 +1,6 @@
 <Solution>
+  <Project Path="../WaistModel/WaistModel.csproj" />
+  <Project Path="../RobotVisualization/RobotVisualization.csproj" />
   <Project Path="waist_motor_controller.csproj" />
   <Project Path="../waist_motor_controller.Tests/waist_motor_controller.Tests.csproj" />
 </Solution>

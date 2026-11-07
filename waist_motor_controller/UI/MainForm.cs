@@ -12,6 +12,7 @@ namespace waist_motor_controller.UI;
 public sealed partial class MainForm : Form
 {
     private const int MaxLogLines = 2000;
+    private waist_motor_controller.WholeBody.WholeBodyPage? _wholeBodyPage;
 
     private readonly CanFdTransport _transport = new();
     private readonly MotorRegistry _registry;
@@ -32,6 +33,8 @@ public sealed partial class MainForm : Form
 
     // 框栏③：单电机控制
     private ComboBox _motorCombo = null!;
+    private ComboBox _directionCombo = null!;
+    private readonly int[] _pendingDirections = new int[4];
     private Label _posLabel = null!;
     private Label _velLabel = null!;
     private Label _modeLabel = null!;
@@ -97,7 +100,10 @@ public sealed partial class MainForm : Form
         _uiTimer = new System.Windows.Forms.Timer { Interval = 100 };
         _uiTimer.Tick += (_, _) => RefreshStatus();
         _syncTimer = new System.Windows.Forms.Timer { Interval = 50 };
-        _syncTimer.Tick += (_, _) => _controller.SendSync();
+        _syncTimer.Tick += (_, _) =>
+        {
+            if (_wholeBodyPage?.PollsFeedback != true) _controller.SendSync();
+        };
         _logFlushTimer = new System.Windows.Forms.Timer { Interval = 2000 };
         _logFlushTimer.Tick += (_, _) => FlushFrameStats();
 
@@ -153,7 +159,19 @@ public sealed partial class MainForm : Form
         _jogAccelNum.Value = (decimal)Math.Clamp(_registry.Config.Profile.OutputAccelRpmPerSec, 0.1, 50);
         _jogStepNum.Value = (decimal)Math.Clamp(_registry.Config.Profile.JogStepDeg, 0.01, 30);
         for (int i = 0; i < 4; i++)
+        {
             _idNums[i].Value = Math.Clamp(_registry.Motors[i].DeviceId, 1, 127);
+            _pendingDirections[i] = _registry.Motors[i].Direction;
+        }
+        UpdateDirectionUi();
+    }
+
+    private void UpdateDirectionUi()
+    {
+        bool open = _transport.IsOpen;
+        _directionCombo.Enabled = !open;
+        int direction = open ? _registry.Motors[CurrentLogicalIndex].Direction : _pendingDirections[CurrentLogicalIndex];
+        _directionCombo.SelectedIndex = direction == 1 ? 0 : 1;
     }
 
     // ================= 连接 / 设备 =================
@@ -191,6 +209,7 @@ public sealed partial class MainForm : Form
         }
         else
         {
+            if (_wholeBodyPage?.PrepareClose() == false) { ShowNotice("全身运控正在停止，请稍后再关闭设备"); return; }
             CloseDeviceSafely();
         }
         UpdateConnectionUi();
@@ -201,6 +220,7 @@ public sealed partial class MainForm : Form
     private void CloseDeviceSafely()
     {
         ++_session;
+        _wholeBodyPage?.ConnectionClosing();
         _readingFirmware = false;
         if (_transport.IsOpen)
             _controller.EmergencyStop();
@@ -209,6 +229,7 @@ public sealed partial class MainForm : Form
         _logFlushTimer.Stop();
         _keepalive.Stop();
         _transport.Close();
+        _wholeBodyPage?.ConnectionClosed();
     }
 
     private void UpdateConnectionUi()
@@ -221,6 +242,7 @@ public sealed partial class MainForm : Form
         _eStopButton.Enabled = open;
         _saveMappingButton.Enabled = !open;
         foreach (var number in _idNums) number.Enabled = !open;
+        UpdateDirectionUi();
     }
 
     // ================= 操作处理 =================
@@ -272,6 +294,7 @@ public sealed partial class MainForm : Form
         try
         {
             var (ok, msg) = await _controller.SetZeroOriginAsync(devId, JogAccel, PpProfileSpeed);
+            _wholeBodyPage?.InvalidateCalibration();
             if (!ok)
                 MessageBox.Show(this, msg, "标零失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             else
@@ -343,7 +366,11 @@ public sealed partial class MainForm : Form
         _registry.Config.Profile.OutputSpeedRpm = PpProfileSpeed;
         _registry.Config.Profile.OutputAccelRpmPerSec = JogAccel;
         _registry.Config.Profile.JogStepDeg = (double)_jogStepNum.Value;
-        _registry.Save();
+        int[] previousDirections = _registry.Motors.Select(m => m.Direction).ToArray();
+        for (int i = 0; i < _pendingDirections.Length; i++) _registry.Motors[i].Direction = _pendingDirections[i];
+        if (!_registry.Save())
+            for (int i = 0; i < previousDirections.Length; i++) _registry.Motors[i].Direction = previousDirections[i];
+        RefreshMotorDisplayNames();
         RefreshStatus();
     }
 
@@ -406,8 +433,9 @@ public sealed partial class MainForm : Form
         }
         else
         {
-            UiValueCache.Text(_posLabel, $"{fb.PositionDeg:F2}°");
-            _uiValues.Tip(_tips, _posLabel, $"输出端位置原值：{fb.PositionRaw} cnt");
+            double jointDeg = fb.PositionRaw == 0 ? 0 : motor.Direction * fb.PositionDeg;
+            UiValueCache.Text(_posLabel, $"{jointDeg:F2}°");
+            _uiValues.Tip(_tips, _posLabel, $"电机角：{fb.PositionDeg:F2}°（{fb.PositionRaw} cnt）");
             UiValueCache.Text(_velLabel, $"{fb.VelocityRpm} RPM");
             UiValueCache.Text(_modeLabel, fb.ModeName);
             UiValueCache.Text(_curLabel, $"{fb.CurrentMa} mA");
@@ -533,6 +561,7 @@ public sealed partial class MainForm : Form
 
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
+        if (_wholeBodyPage?.PrepareClose() == false) { e.Cancel = true; return; }
         if (_transport.IsOpen)
             CloseDeviceSafely();
         _transport.Dispose();

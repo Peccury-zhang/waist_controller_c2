@@ -296,6 +296,26 @@ public sealed class CanFdTransport : IDisposable, ICanTransport
         }
     }
 
+    public int SendBatch(IReadOnlyList<CanFrame> frames)
+    {
+        if (frames.Count == 0 || frames.Count > 4 || frames.Any(f => !f.IsFd)) throw new ArgumentException("Only 1-4 FD frames allowed");
+        lock (_sendGate)
+        {
+            if (!IsOpen) return 0;
+            int size = Marshal.SizeOf<ZlgCanNative.ZCAN_TransmitFD_Data>();
+            IntPtr buffer = Marshal.AllocHGlobal(size * frames.Count);
+            try
+            {
+                for (int i = 0; i < frames.Count; i++) Marshal.StructureToPtr(new ZlgCanNative.ZCAN_TransmitFD_Data { frame = ToFdFrame(frames[i]), transmit_type = 0 }, buffer + i * size, false);
+                uint count = ZlgCanNative.ZCAN_TransmitFD(_channelHandle, buffer, (uint)frames.Count);
+                int accepted = count <= frames.Count ? (int)count : 0;
+                Interlocked.Add(ref _txCount, accepted); return accepted;
+            }
+            catch (Exception ex) { Log?.Invoke("Batch send failed: " + ex.Message); return 0; }
+            finally { Marshal.FreeHGlobal(buffer); }
+        }
+    }
+
     private static ZlgCanNative.canfd_frame ToFdFrame(CanFrame f)
         => new()
         {
@@ -508,7 +528,7 @@ public sealed class CanFdTransport : IDisposable, ICanTransport
             {
                 int devId = (int)(id - Od.EmcyBase);
                 var fault = new MotorFeedback { DeviceId = devId, HasError = true,
-                    FaultCode = (ushort)(data[0] | data[1] << 8), Timestamp = Environment.TickCount64 };
+                    FaultCode = (ushort)(data[0] | data[1] << 8) };
                 lock (_cacheGate) _feedback[devId] = fault;
                 FeedbackUpdated?.Invoke(devId, fault);
             }

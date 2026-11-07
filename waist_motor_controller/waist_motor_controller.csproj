@@ -13,6 +13,7 @@
 
   <ItemGroup>
     <EmbeddedResource Include="assets\yclab.ico" LogicalName="waist_motor_controller.yclab.ico" />
+    <EmbeddedResource Include="assets\yclab2_orange.png" LogicalName="waist_motor_controller.yclab2_orange.png" />
     <None Update="native\ControlCANFD.dll">
       <!-- P/Invoke 与启动检查都在输出根目录找 DLL，故 Link 到根 -->
       <Link>ControlCANFD.dll</Link>
@@ -20,4 +21,9 @@
     </None>
   </ItemGroup>
 
+  <ItemGroup>
+    <ProjectReference Include="../WaistModel/WaistModel.csproj" />
+    <ProjectReference Include="../RobotVisualization/RobotVisualization.csproj" />
+    <Content Include="../../shared_files/urdf_G3_06/**/*" Link="assets/robot/%(RecursiveDir)%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
 </Project>

@@ -39,7 +39,7 @@ internal static class UiTheme
     }
 }
 
-internal enum ActionKind { Secondary, Primary, Success, Warning, Danger, Navigation, SoftDanger, SoftOrange }
+internal enum ActionKind { Secondary, Primary, Success, Warning, Danger, Navigation, SoftDanger, SoftOrange, Jog }
 internal enum SegmentPosition { Standalone, First, Middle, Last }
 
 /// <summary>自行绘制全部状态，避免系统主题把禁用文字绘成深色，支持鼠标与键盘反馈。</summary>
@@ -50,6 +50,8 @@ internal class ActionButton : Button
     public ActionKind Kind { get; set; }
     [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
     public bool WhiteText { get; set; }
+    [System.ComponentModel.DefaultValue(false)]
+    internal bool FitLabel { get; set; }
     [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
     public SegmentPosition Segment { get; set; }
 
@@ -107,7 +109,17 @@ internal class ActionButton : Button
         e.Graphics.Clear(UiTheme.ParentBackground(this));
         e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
         Color fill, text, border;
-        if (!Enabled)
+        if (Kind == ActionKind.Jog)
+        {
+            (fill, text, border) = (Enabled, _pressed, _hovered) switch
+            {
+                (false, _, _) => (Color.FromArgb(69, 73, 80), Color.FromArgb(224, 224, 224), Color.FromArgb(94, 99, 107)),
+                (true, true, _) => (Color.FromArgb(160, 63, 7), Color.White, Color.FromArgb(223, 121, 46)),
+                (true, false, true) => (Color.FromArgb(205, 95, 22), Color.White, Color.FromArgb(255, 165, 85)),
+                _ => (Color.FromArgb(187, 79, 13), Color.White, Color.FromArgb(229, 122, 49)),
+            };
+        }
+        else if (!Enabled)
         {
             fill = Color.FromArgb(28, 38, 53); text = Color.FromArgb(178, 191, 209); border = Color.FromArgb(42, 56, 76);
         }
@@ -156,13 +168,24 @@ internal class ActionButton : Button
         if (Enabled && !_pressed) PaintFillOverlay(e.Graphics, outline);
         e.Graphics.DrawPath(pen, outline);
         var content = new Rectangle(8, _pressed ? 1 : 0, Width - 16, Height);
-        TextRenderer.DrawText(e.Graphics, Text, Font, content, text,
-            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.SingleLine);
+        const TextFormatFlags textFlags = TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter
+            | TextFormatFlags.EndEllipsis | TextFormatFlags.SingleLine;
+        using var fittedFont = FitLabel ? FitLabelFont(e.Graphics, content.Width) : null;
+        TextRenderer.DrawText(e.Graphics, Text, fittedFont ?? Font, content, text, textFlags);
         if (Enabled && Focused && ShowFocusCues)
             ControlPaint.DrawFocusRectangle(e.Graphics, Rectangle.Inflate(ClientRectangle, -7, -7), text, fill);
     }
 
     protected virtual void PaintFillOverlay(Graphics graphics, GraphicsPath outline) { }
+
+    private Font? FitLabelFont(Graphics graphics, int width)
+    {
+        int measured = TextRenderer.MeasureText(graphics, Text, Font, Size.Empty, TextFormatFlags.SingleLine).Width;
+        if (measured <= width) return null;
+        // Leave room for glyph padding and pixel rounding in the fitted font.
+        float scale = Math.Clamp((width - 12f) / measured, 0.72f, 1f);
+        return new Font(Font.FontFamily, Font.SizeInPoints * scale, Font.Style, GraphicsUnit.Point);
+    }
 }
 
 internal class SurfacePanel : Panel

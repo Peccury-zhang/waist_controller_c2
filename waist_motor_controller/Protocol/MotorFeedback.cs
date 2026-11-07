@@ -1,3 +1,5 @@
+using System.Diagnostics;
+
 namespace waist_motor_controller.Protocol;
 
 public sealed class MotorFeedback
@@ -17,7 +19,8 @@ public sealed class MotorFeedback
     public bool HasError { get; init; }
     /// <summary>确认协议B11.bit4；备用协议没有此位时为null。</summary>
     public bool? TargetReached { get; init; }
-    public long Timestamp { get; init; }
+    public static long Now => Stopwatch.GetElapsedTime(0).Ticks / TimeSpan.TicksPerMillisecond;
+    public long Timestamp { get; init; } = Now;
     public string ModeName => IsFirmware117 ? Mode switch
     { 1 => "PP 轮廓位置", 2 => "PV 轮廓速度", 3 => "CSP 同步位置", 4 => "CSV 同步速度", 0 => "待机(0)", _ => $"模式({Mode})" } : Mode switch
     {

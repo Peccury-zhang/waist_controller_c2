@@ -13,6 +13,20 @@ public sealed class MotorController
     private readonly long[] _enabledSince = new long[128];
     private readonly bool[] _calibrating = new bool[128];
     private int _generation;
+    private bool _wholeBodyOwned;
+    public event Action? WholeBodyEmergency;
+    public bool WholeBodyOwned { get { lock (_gate) return _wholeBodyOwned; } }
+    public bool TryAcquireWholeBody()
+    {
+        lock (_gate)
+        {
+            if (_wholeBodyOwned || _calibrating.Any(x => x) || _registry.Motors.Any(m => _keepalive.IsMoving(m.DeviceId) || (_keepalive.IsArmed(m.DeviceId) && !IsAtTarget(m.DeviceId)))) return false;
+            _keepalive.DisarmAll();
+            _wholeBodyOwned = true; return true;
+        }
+    }
+    public void ReleaseWholeBody() { lock (_gate) _wholeBodyOwned = false; }
+
     public event Action<string>? Log;
 
     public MotorController(ICanTransport transport, KeepaliveScheduler keepalive, MotorRegistry registry)
@@ -29,12 +43,20 @@ public sealed class MotorController
         _keepalive.AxisStopped += (id, reason) => Log?.Invoke($"电机 {id}：{reason}");
     }
     private bool Configured(int id) => _registry.Motors.Any(m => m.DeviceId == id);
+    private int Direction(int id) => _registry.Motors.FirstOrDefault(m => m.DeviceId == id)?.Direction ?? 1;
+
+    internal (bool Ok, string Message) MoveToJointPosition(int id, double targetDeg, double accel, double speed) =>
+        MoveToPosition(id, Direction(id) * targetDeg, accel, speed);
+
+    internal (bool Ok, string Message) MoveJointIncrement(int id, double deltaDeg, double accel, double speed) =>
+        MoveIncrement(id, Direction(id) * deltaDeg, accel, speed);
     public bool IsJogging(int id) => _keepalive.IsMoving(id);
     public bool IsBusy(int id) { lock (_gate) return _calibrating[id]; }
     public bool IsWithinEnableWindow(int id) => _enabledSince[id] != 0 &&
         Environment.TickCount64 - _enabledSince[id] < 150;
     private string? Check(int id, bool motion = false)
     {
+        if (_wholeBodyOwned) return "全身运控占用四轴，请先退出 CSP";
         if (!Configured(id)) return "只允许控制已保存映射的四个电机";
         if (!_transport.IsOpen || !_transport.IsDeviceAlive(id)) return $"电机 {id} 无新鲜反馈（500ms）";
         if (_calibrating[id]) return "标零处理中";
@@ -90,6 +112,7 @@ public sealed class MotorController
     {
         lock (_gate)
         {
+            if (_wholeBodyOwned) return (false, "全身运控占用四轴，请先退出 CSP");
             if (!Configured(id)) return (false, "节点未配置");
             ++_generation;
             _enabledSince[id] = 0;
@@ -101,6 +124,7 @@ public sealed class MotorController
     {
         lock (_gate)
         {
+            if (_wholeBodyOwned) return (false, "全身运控占用四轴，请先退出 CSP");
             if (!Configured(id) || _calibrating[id]) return (false, "节点未配置或正在标零");
             var fb = _transport.GetFeedback(id);
             if (fb != null && fb.FaultCode != 0)
@@ -129,7 +153,7 @@ public sealed class MotorController
                 if (!_keepalive.Move(id, Od.AngleToRaw(targetDeg), speed, accel)) return (false, "未使能或正在运动");
             }
             catch (ArgumentOutOfRangeException ex) { return (false, ex.Message); }
-            Log?.Invoke($"电机 {id} 定位 → {targetDeg:F3}°，输出端速度 {speed:F2}rpm，加速度 {accel:F2}rpm/s");
+            Log?.Invoke($"电机 {id} 定位 → {targetDeg:F3}°（电机角），输出端速度 {speed:F2}rpm，加速度 {accel:F2}rpm/s");
             return (true, "位置轨迹已启动");
         }
     }
@@ -137,6 +161,7 @@ public sealed class MotorController
     {
         lock (_gate)
         {
+            if (_wholeBodyOwned) return (false, "请在全身运控页点击“停止并退出 CSP”，等待退出后再使能回零");
             int[] configured = _registry.Motors.Select(m => m.DeviceId).ToArray();
             int[] ids = configured.Where(id => _keepalive.IsArmed(id) && _transport.GetFeedback(id)?.Enabled != false).ToArray();
             int[] skipped = configured.Except(ids).ToArray();
@@ -176,6 +201,7 @@ public sealed class MotorController
     {
         lock (_gate)
         {
+            if (_wholeBodyOwned) return (false, "全身运控占用四轴，请先退出 CSP");
             if (!Configured(id)) return (false, "节点未配置");
             _keepalive.Hold(id);
             Log?.Invoke($"电机 {id} 已停止轨迹，保持最后指令位置");
@@ -218,7 +244,7 @@ public sealed class MotorController
                 write = _transport.SdoRequestAsync(id, SdoMessage.WriteU32(id, Od.ZeroSet, 0, 0));
             }
             rsp = await write.ConfigureAwait(false);
-            long verificationStart = Environment.TickCount64;
+            long verificationStart = MotorFeedback.Now;
             lock (_gate)
             {
                 if (generation != _generation) return (false, "操作已取消");
@@ -247,6 +273,7 @@ public sealed class MotorController
     }
     public (bool Ok, string Message) EmergencyStop()
     {
+        WholeBodyEmergency?.Invoke();
         lock (_gate)
         {
             ++_generation;
@@ -267,6 +294,7 @@ public sealed class MotorController
         int generation;
         lock (_gate)
         {
+            if (_wholeBodyOwned) return (false, "全身运控占用四轴，请先退出 CSP");
             if (!Configured(currentId) || newId is < 1 or > 127 || newId == currentId)
                 return (false, "仅可修改已配置节点，新ID须为1~127并与原ID不同");
             if (_registry.Motors.Any(m => m.DeviceId == newId)) return (false, "新ID已被占用");

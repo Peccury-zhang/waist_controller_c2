@@ -14,6 +14,7 @@ public sealed class MotorConfig
     public int LogicalId { get; set; }
     public string Name { get; set; } = "";
     public int DeviceId { get; set; }
+    public int Direction { get; set; }
     public bool UseFirmware117Pdo { get; set; } = true;
     public string Model { get; set; } = "";
     public string ExpectedFirmware { get; set; } = "";
@@ -35,10 +36,10 @@ public sealed class AppConfig
         SchemaVersion = 2,
         Motors = new()
         {
-            new() { LogicalId = 1, Name = "最上部腰部旋转", DeviceId = 3, Model = "R120", ExpectedFirmware = "V1.17.12" },
-            new() { LogicalId = 2, Name = "折叠腿高", DeviceId = 4, Model = "R120MAX", ExpectedFirmware = "V1.17.13" },
-            new() { LogicalId = 3, Name = "折叠腿中", DeviceId = 5, Model = "R120MAX", ExpectedFirmware = "V1.17.13" },
-            new() { LogicalId = 4, Name = "折叠腿最底部", DeviceId = 6, Model = "R120MAX", ExpectedFirmware = "V1.17.13" },
+            new() { LogicalId = 1, Name = "最上部腰部旋转", DeviceId = 3, Direction = -1, Model = "R120", ExpectedFirmware = "V1.17.12" },
+            new() { LogicalId = 2, Name = "折叠腿高", DeviceId = 4, Direction = -1, Model = "R120MAX", ExpectedFirmware = "V1.17.13" },
+            new() { LogicalId = 3, Name = "折叠腿中", DeviceId = 5, Direction = 1, Model = "R120MAX", ExpectedFirmware = "V1.17.13" },
+            new() { LogicalId = 4, Name = "折叠腿最底部", DeviceId = 6, Direction = -1, Model = "R120MAX", ExpectedFirmware = "V1.17.13" },
         }
     };
 }
@@ -73,6 +74,8 @@ public sealed class MotorRegistry
             cfg.Motors = cfg.Motors.OrderBy(m => m.LogicalId).ToList();
             bool legacy = cfg.SchemaVersion < 2;
             var defaults = AppConfig.CreateDefault();
+            for (int i = 0; i < cfg.Motors.Count; i++)
+                if (cfg.Motors[i].Direction is not (-1 or 1)) cfg.Motors[i].Direction = defaults.Motors[i].Direction;
             if (legacy)
             {
                 // 只迁移完整旧默认映射，保留用户自定义ID；旧速度单位不同，重置为低速默认值。

@@ -14,6 +14,10 @@ internal static class Program
     private static extern nint SendMessage(nint hwnd, int message, nint wParam, nint lParam);
     [System.Runtime.InteropServices.DllImport("user32.dll")]
     private static extern bool PrintWindow(nint hwnd, nint deviceContext, uint flags);
+    [System.Runtime.InteropServices.DllImport("user32.dll", ExactSpelling = true)]
+    private static extern bool GetWindowRect(nint hwnd, out NativeRect rect);
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    private struct NativeRect { public int Left, Top, Right, Bottom; }
     [System.Runtime.InteropServices.DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")]
     private static extern nint GetWindowStyle(nint hwnd, int index);
     [System.Runtime.InteropServices.DllImport("uxtheme.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
@@ -31,15 +35,36 @@ internal static class Program
     {
         try
         {
+            if (args.Contains("--wbc-render")) { WbcRender(); return 0; }
             if (args.Contains("--capture")) { Capture().GetAwaiter().GetResult(); return 0; }
             if (args.Contains("--ui-smoke")) { UiSmoke(); return 0; }
             if (args.Contains("--frame-smoke")) { FrameSmoke(); return 0; }
             if (args.Contains("--render")) { Render(args); return 0; }
+            WholeBodyTests.Run();
             Run().GetAwaiter().GetResult();
             Console.WriteLine($"PASS: {count} assertions; no hardware opened.");
             return 0;
         }
         catch (Exception ex) { Console.Error.WriteLine(ex); return 1; }
+    }
+
+    static void WbcRender()
+    {
+        ApplicationConfiguration.Initialize();
+        using var form=new MainForm();form.StartPosition=FormStartPosition.Manual;form.Location=new Point(-5000,-5000);form.ShowInTaskbar=false;form.Show();
+        var flags=BindingFlags.Instance|BindingFlags.NonPublic;
+        typeof(MainForm).GetMethod("SelectPage",flags)!.Invoke(form,new object[]{2});
+        for(int i=0;i<15;i++){Application.DoEvents();Thread.Sleep(30);}
+        var page=typeof(MainForm).GetField("_wholeBodyPage",flags)!.GetValue(form) ?? throw new Exception("Whole-body page failed to initialize");
+        var view=(RobotVisualization.RobotView)page.GetType().GetField("view",flags)!.GetValue(page)!;
+        string dir=Path.Combine(AppContext.BaseDirectory,"wbc-render");Directory.CreateDirectory(dir);
+        view.SaveSnapshot(Path.Combine(dir,"robot.png"));
+        using var bmp=new Bitmap(form.Width,form.Height);form.DrawToBitmap(bmp,new Rectangle(Point.Empty,bmp.Size));bmp.Save(Path.Combine(dir,"page.png"));
+        typeof(MainForm).GetMethod("SelectPage",flags)!.Invoke(form,new object[]{3});
+        for(int i=0;i<12;i++){Application.DoEvents();Thread.Sleep(30);}
+        using var calBitmap=new Bitmap(form.Width,form.Height);form.DrawToBitmap(calBitmap,new Rectangle(Point.Empty,calBitmap.Size));calBitmap.Save(Path.Combine(dir,"calibration.png"));
+        Console.WriteLine("PASS WBC UI: loaded model and rendered both pages at "+dir);
+        form.Close();
     }
 
     static async Task Run()
@@ -172,16 +197,26 @@ internal static class Program
         {
             var defaults = AppConfig.CreateDefault();
             Assert(defaults.Motors.Select(m => m.DeviceId).SequenceEqual(new[] { 3, 4, 5, 6 }), "new IDs");
+            Assert(defaults.Motors.Select(m => m.Direction).SequenceEqual(new[] { -1, -1, 1, -1 }), "default joint direction signs");
             string config = Path.Combine(temp, "motors.json");
             defaults.SchemaVersion = 1;
-            for (int i = 0; i < 4; i++) defaults.Motors[i].DeviceId = 11 + i;
+            for (int i = 0; i < 4; i++)
+            {
+                defaults.Motors[i].DeviceId = 11 + i;
+                defaults.Motors[i].Direction = 0; // Value deserialized when older configs omit Direction.
+            }
             File.WriteAllText(config, JsonSerializer.Serialize(defaults));
             var registry = new MotorRegistry(config);
+            Assert(registry.Motors.Select(m => m.Direction).SequenceEqual(new[] { -1, -1, 1, -1 }), "legacy configurations keep logical joint directions");
             Assert(registry.Motors.Select(m => m.DeviceId).SequenceEqual(new[] { 3, 4, 5, 6 }), "legacy IDs migrated");
             Assert(File.Exists(config + ".pre-v2.bak") && registry.Config.SchemaVersion == 2, "migration backup");
             defaults.Motors[0].DeviceId = 21;
             File.WriteAllText(config, JsonSerializer.Serialize(defaults));
             Assert(new MotorRegistry(config).Motors[0].DeviceId == 21, "custom ID preserved");
+            var customDirection = new MotorRegistry(config);
+            Assert(customDirection.Motors[0].Direction == -1, "direction default follows logical joint, not CAN ID");
+            customDirection.Motors[0].Direction = 1;
+            Assert(customDirection.Save() && new MotorRegistry(config).Motors[0].Direction == 1, "custom joint direction survives save and reload");
 
             var fake = new FakeCan();
             var frames = new List<CanFrame>();
@@ -193,6 +228,7 @@ internal static class Program
             fake.Alive = true;
             Assert(!controller.MoveToPosition(3, 10, 5, 1).Ok, "motion requires local enable");
             Assert(controller.Enable(3, 5, 1).Ok && frames[^1].ReadBe16(1) == 0, "enable holds feedback");
+            Assert(controller.Enable(5, 5, 1).Ok, "enable positive direction joint");
             Assert(!controller.MoveToPosition(3, 10, 5, 1).Ok, "enable window enforced");
             await Task.Delay(160);
             Assert(controller.MoveIncrement(3, 1, 5, 1).Ok, "positive increment");
@@ -201,6 +237,12 @@ internal static class Program
             controller.StopMotion(3);
             Assert(!scheduler.IsMoving(3), "stop holds");
             Assert(controller.MoveIncrement(3, -1, 5, 1).Ok && scheduler.GetTarget(3) == Od.AngleToRaw(-1), "negative increment");
+            controller.StopMotion(3);
+            Assert(controller.MoveJointIncrement(3, 1, 5, 1).Ok && scheduler.GetTarget(3) == Od.AngleToRaw(-1), "positive joint jog maps to negative motor increment");
+            controller.StopMotion(3);
+            Assert(controller.MoveJointIncrement(5, 1, 5, 1).Ok && scheduler.GetTarget(5) == Od.AngleToRaw(1), "middle joint preserves positive motor increment");
+            controller.StopMotion(5);
+            Assert(controller.MoveToJointPosition(3, 10, 5, 1).Ok && scheduler.GetTarget(3) == Od.AngleToRaw(-10), "joint absolute target uses same direction as jog");
             controller.StopMotion(3);
             Assert(controller.MoveToPosition(3, 20, 5, 1).Ok, "absolute move");
             for (int i = 0; i < 20; i++) scheduler.Tick(0.001);
@@ -470,6 +512,24 @@ internal static class Program
         void Check(string phase)
         {
             Application.DoEvents();
+            var titleBar = form.Controls.OfType<WindowTitleBar>().Single();
+            nint HitControl(System.Windows.Forms.Control control, Point screenPoint)
+                => SendMessage(control.Handle, 0x84, 0,
+                    (nint)((screenPoint.X & 0xffff) | (screenPoint.Y & 0xffff) << 16));
+            // Test the child windows that actually receive pointer hit tests,
+            // not just direct messages to the top-level form.
+            foreach (var surface in new System.Windows.Forms.Control[] { titleBar,
+                titleBar.Controls.OfType<Label>().Single(), titleBar.Controls.OfType<PictureBox>().Single() })
+            {
+                var point = surface.PointToScreen(new Point(surface.Width / 2, surface.Height / 2));
+                Assert(HitControl(surface, point) == -1, $"{phase}: {surface.GetType().Name} passes hit testing to parent");
+                Assert(HitControl(form, point) == 2, $"{phase}: caption surface resolves to native window dragging");
+            }
+            foreach (var button in titleBar.Controls.OfType<FlowLayoutPanel>().Single().Controls.OfType<Button>())
+            {
+                var point = button.PointToScreen(new Point(button.Width / 2, button.Height / 2));
+                Assert(HitControl(button, point) == 1, $"{phase}: {button.AccessibleName} remains clickable");
+            }
             Assert((GetWindowStyle(form.Handle, -16).ToInt64() & 0x00C00000) == 0, $"{phase}: no system caption style");
             Assert(form.PointToScreen(Point.Empty) == form.Location && form.ClientSize == form.Size, $"{phase}: no native caption or border inset; origin={form.PointToScreen(Point.Empty)}, location={form.Location}, client={form.ClientSize}, size={form.Size}");
             using var image = new Bitmap(form.Width, form.Height);
@@ -609,6 +669,7 @@ internal static class Program
                 string suffix = pageIndex == 0 ? "" : new[] { "", "-joints", "-whole-body", "-calibration" }[pageIndex];
                 string path = Path.GetFullPath($"tmp/{prefix}{suffix}-{size.Width}.png");
                 Directory.CreateDirectory(Path.GetDirectoryName(path)!); image.Save(path); Console.WriteLine(path);
+                if (pageIndex == 0) RenderLogExpansion(form, size.Width);
                 if (pageIndex == 1 && size.Width == 1920)
                 {
                     var content = pages[1].Controls[0];
@@ -627,6 +688,18 @@ internal static class Program
             Assert(!animation.Visible && pages[1].Visible && pages.Where((p, i) => i != 1).All(p => !p.Visible), "rapid navigation settles on latest requested page");
             selection.DroppedDown = true; Application.DoEvents();
             Assert(selection.DroppedDown, "custom joint selector opens native dropdown");
+            nint popup = ((JointComboBox)selection).PopupHandle;
+            if (GetWindowRect(popup, out var popupBounds))
+            {
+                using var popupImage = new Bitmap(popupBounds.Right - popupBounds.Left, popupBounds.Bottom - popupBounds.Top);
+                using (var graphics = Graphics.FromImage(popupImage))
+                {
+                    nint context = graphics.GetHdc();
+                    try { Assert(PrintWindow(popup, context, 0), "native dropdown preview renders"); }
+                    finally { graphics.ReleaseHdc(context); }
+                }
+                popupImage.Save(Path.GetFullPath($"tmp/ui-joint-dropdown-{size.Width}.png"));
+            }
             selection.SelectedIndex = 3;
             selection.DroppedDown = false; Application.DoEvents();
             Assert(selection.SelectedIndex == 3, "custom joint selector preserves selection behavior");
@@ -640,6 +713,39 @@ internal static class Program
         dialog.Close();
         RenderNavigationHover();
         RenderButtonStates();
+    }
+
+    static void RenderLogExpansion(MainForm form, int width)
+    {
+        var toggle = (Button)form.Controls.Find("ToggleLogButton", true).Single();
+        var clear = (Button)form.Controls.Find("ClearLogButton", true).Single();
+        var log = (TextBox)typeof(MainForm).GetField("_logBox", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(form)!;
+        var card = toggle.Parent!.Parent!;
+        int collapsedHeight = card.Height;
+        Assert(!log.Visible && toggle.Text.Contains("显示日志") && clear.Left > toggle.Right, "logs start collapsed with clear to the right");
+        const string sample = "离线预览：通信日志保留检查";
+        log.AppendText(sample);
+        toggle.PerformClick();
+        Assert(card.Height == collapsedHeight, "log reveal starts at its collapsed height");
+        WaitFor(() => card.Height == card.Parent!.ClientSize.Height);
+        Assert(log.Visible && card.Height > collapsedHeight && log.Text.Contains(sample) && toggle.Text.Contains("收起日志"), "log expands without discarding text");
+        using (var expanded = new Bitmap(form.ClientSize.Width, form.ClientSize.Height))
+        {
+            form.DrawToBitmap(expanded, new Rectangle(Point.Empty, expanded.Size));
+            expanded.Save(Path.GetFullPath($"tmp/ui-log-expanded-{width}.png"));
+        }
+        toggle.PerformClick();
+        WaitFor(() => !log.Visible);
+        Assert(card.Height == collapsedHeight && log.Text.Contains(sample), "collapsing restores header height and preserves logs");
+        clear.PerformClick();
+        Assert(log.TextLength == 0, "clear works while the log is collapsed");
+
+        static void WaitFor(Func<bool> done)
+        {
+            var clock = System.Diagnostics.Stopwatch.StartNew();
+            while (!done() && clock.ElapsedMilliseconds < 1500) { Application.DoEvents(); Thread.Sleep(10); }
+            Assert(done(), "log animation reaches its target state");
+        }
     }
 
     static void RenderNavigationHover()
@@ -756,7 +862,7 @@ internal static class Program
         public MotorFeedback GetFeedback(int id) => new()
         {
             DeviceId = id, PositionRaw = Positions.GetValueOrDefault(id), Enabled = true, BrakeReleased = true, Mode = 1,
-            Timestamp = Environment.TickCount64, FaultCode = Fault, HasError = Fault != 0,
+            Timestamp = MotorFeedback.Now, FaultCode = Fault, HasError = Fault != 0,
             TemperatureRaw = Temperature, IsFirmware117 = true, TargetReached = Reached,
         };
         public bool IsDeviceAlive(int id, int windowMs = 500) => Alive && !OfflineIds.Contains(id);
