@@ -49,10 +49,12 @@ internal sealed class CspTrace
         {
             using (var file = new StreamWriter(pending, append: false, new UTF8Encoding(true)))
             {
-                file.WriteLine("time_ms,state,trajectory_s,cycle_ms,axis,can_id,target_sent_ms,feedback_received_ms,feedback_age_ms,target_raw,actual_raw,target_deg,actual_deg,error_deg,command_output_rpm,feedback_motor_rpm,current_ma,drive_mode,enabled,brake_released,fault_code,event");
+                file.WriteLine("time_ms,state,trajectory_s,cycle_ms,axis,can_id,target_sent_ms,feedback_received_ms,feedback_age_ms,target_raw,actual_raw,target_deg,actual_deg,error_deg,command_output_rpm,feedback_motor_rpm,current_ma,drive_mode,enabled,brake_released,fault_code,event,target_pitch_deg,actual_pitch_deg");
                 for (int n = 0; n < Count; n++)
                 {
                     var s = samples[n];
+                    double targetPitch = Enumerable.Range(1, 3).Sum(i => Calibration.FeedbackToUrdf(i, s.Target[i], s.Signs[i])) * 180 / Math.PI;
+                    double actualPitch = Enumerable.Range(1, 3).Sum(i => Calibration.FeedbackToUrdf(i, s.Feedback[i].PositionRaw, s.Signs[i])) * 180 / Math.PI;
                     for (int i = 0; i < s.Feedback.Length; i++)
                     {
                         var feedback = s.Feedback[i];
@@ -63,12 +65,12 @@ internal sealed class CspTrace
                             ? Joint(s.Target[i] - s.PreviousTarget[i]) * 60 / (2 * Math.PI * s.TargetInterval)
                             : 0;
                         file.WriteLine(FormattableString.Invariant(
-                            $"{s.TimeMs - startedAt},{s.State},{s.TrajectorySeconds:F6},{s.CycleSeconds * 1000:F3},{i + 1},{feedback.DeviceId},{s.TargetSentMs - startedAt},{feedback.Timestamp - startedAt},{s.TimeMs - feedback.Timestamp},{s.Target[i]},{feedback.PositionRaw},{commanded:F6},{actual:F6},{actual - commanded:F6},{rpm:F6},{feedback.VelocityRpm},{feedback.CurrentMa},{feedback.Mode},{Convert.ToInt32(feedback.Enabled)},{Convert.ToInt32(feedback.BrakeReleased)},0x{feedback.FaultCode:X4},"));
+                            $"{s.TimeMs - startedAt},{s.State},{s.TrajectorySeconds:F6},{s.CycleSeconds * 1000:F3},{i + 1},{feedback.DeviceId},{s.TargetSentMs - startedAt},{feedback.Timestamp - startedAt},{s.TimeMs - feedback.Timestamp},{s.Target[i]},{feedback.PositionRaw},{commanded:F6},{actual:F6},{actual - commanded:F6},{rpm:F6},{feedback.VelocityRpm},{feedback.CurrentMa},{feedback.Mode},{Convert.ToInt32(feedback.Enabled)},{Convert.ToInt32(feedback.BrakeReleased)},0x{feedback.FaultCode:X4},,{targetPitch:F6},{actualPitch:F6}"));
                     }
                 }
-                var footer = new string[22];
+                var footer = new string[24];
                 footer[0] = (endedAt - startedAt).ToString(System.Globalization.CultureInfo.InvariantCulture);
-                footer[^1] = "\"" + endReason?.Replace("\"", "\"\"") + "\"";
+                footer[21] = "\"" + endReason?.Replace("\"", "\"\"") + "\"";
                 file.WriteLine(string.Join(",", footer));
             }
             File.Move(pending, path);

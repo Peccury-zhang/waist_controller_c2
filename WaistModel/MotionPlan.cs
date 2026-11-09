@@ -45,6 +45,7 @@ public sealed partial class MotionPlan
     }
     public double[] At(double t)
     {
+        if (smoothLegs is not null) return SmoothPosition(t);
         if (axisDurations is not null)
             return Enumerable.Range(0, 4).Select(i => AxisPosition(i, t)).ToArray();
 

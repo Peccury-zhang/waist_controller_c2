@@ -59,7 +59,9 @@ public sealed class WholeBodyController : IDisposable
         {
             lock (gate)
                 return plan is not null && moveLDeviation is { } error
-                    ? $"横偏 {error.CrossTrackMm:F2} mm · 沿线差 {error.AlongErrorMm:+0.00;-0.00;0.00} mm · 姿态差 {error.AngleErrorDeg:F2}°"
+                    ? plan.IsSmooth
+                        ? $"位置跟踪差 {error.CrossTrackMm:F2} mm · 姿态差 {error.AngleErrorDeg:F2}°"
+                        : $"横偏 {error.CrossTrackMm:F2} mm · 沿线差 {error.AlongErrorMm:+0.00;-0.00;0.00} mm · 姿态差 {error.AngleErrorDeg:F2}°"
                     : null;
         }
     }
@@ -226,7 +228,7 @@ public sealed class WholeBodyController : IDisposable
             if (start.Where((x,i)=>Math.Abs(x-feedbackJoints[i])>0.01).Any() ||
                 start.Where((x,i)=>Math.Abs(x-hold[i])>0.001).Any())
                 throw new InvalidOperationException("起点变化，请从当前保持位置重新规划");
-            if (next.ExpectedMoveLPose(0) is { } plannedStart &&
+            if (next.ExpectedPose(0) is { } plannedStart &&
                 (!DiskKinematics.Matches(plannedStart, feedbackJoints) ||
                  !DiskKinematics.Matches(plannedStart, hold)))
                 throw new InvalidOperationException("实测或保持位姿已偏离 MoveL 起点，请等待稳定后重试");
@@ -429,10 +431,10 @@ public sealed class WholeBodyController : IDisposable
                                 : "已回到规划区，等待反馈稳定";
                     }
                 }
-                if (plan?.ExpectedMoveLPose(elapsed) is not null)
+                if (plan?.ExpectedPose(elapsed) is not null)
                 {
                     var actual = DiskKinematics.Forward(fb.Select((axis, i) => calibration.ToJoint(i, axis.PositionRaw)).ToArray());
-                    moveLDeviation = plan.MoveLDeviation(elapsed, actual);
+                    moveLDeviation = plan.TrackingDeviation(elapsed, actual);
                 }
                 if (plan is not null)
                 {

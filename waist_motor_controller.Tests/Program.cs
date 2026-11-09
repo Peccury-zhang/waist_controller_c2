@@ -40,6 +40,7 @@ internal static class Program
             if (args.Contains("--ui-smoke")) { UiSmoke(); return 0; }
             if (args.Contains("--frame-smoke")) { FrameSmoke(); return 0; }
             if (args.Contains("--render")) { Render(args); return 0; }
+            ApplicationConfiguration.Initialize();
             WholeBodyTests.Run();
             var previousContext = SynchronizationContext.Current;
             WholeBodyPageTests.Run();

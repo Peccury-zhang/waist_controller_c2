@@ -8,6 +8,9 @@ internal sealed record WholeBodyPoint(Guid Id, string Name, double HeightMm, dou
     double ForeAftMm, double[] AxisAnglesDeg)
 {
     [JsonIgnore] public TaskPose Pose => new(ForeAftMm / 1000, HeightMm / 1000, PitchDeg * Math.PI / 180, YawDeg * Math.PI / 180);
+
+    [JsonIgnore] public bool IsZeroPose => AxisAnglesDeg.All(angle => angle == 0) &&
+        DiskKinematics.Matches(Pose, new double[4]);
 }
 
 internal sealed class WholeBodyPointStore(string filePath)
@@ -44,6 +47,17 @@ internal sealed class WholeBodyPointStore(string filePath)
     {
         if (points.RemoveAll(point => point.Id == id) == 0)
             throw new InvalidOperationException("点位已删除，请重新选择");
+    });
+
+    public WholeBodyPoint[] Move(Guid id, Guid anchorId, bool after) => Update(points =>
+    {
+        var point = points.Find(p => p.Id == id);
+        if (point is null || !points.Any(p => p.Id == anchorId))
+            throw new InvalidOperationException("点位列表已变化，请重新拖动");
+        if (id == anchorId) return;
+        points.Remove(point);
+        int destination = points.FindIndex(p => p.Id == anchorId);
+        points.Insert(after ? destination + 1 : destination, point);
     });
 
     private static bool IsValid(WholeBodyPoint point) =>

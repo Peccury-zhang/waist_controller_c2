@@ -20,6 +20,8 @@ internal static class WholeBodyTests
         CheckCspLateAdvance(r, c);
         CheckParkingInterlockDuringMotion(r);
         CheckStraightPoseMoves(r);
+        SmoothMotionTests.Run(r);
+        CheckSmoothExecution(r);
         double[] outsideUrdf=[0,1.0,-.6,0];c.Check(outsideUrdf,false);Check(true,"calibration overrides URDF limits");
         foreach(double bad in new[]{.351,-.501,double.NaN})Reject(()=>c.CheckX(bad),"task bound");
         var rng=new Random(42);
@@ -408,7 +410,7 @@ internal static class WholeBodyTests
         bus.Refresh(true);
         var last = registry.Motors.Select((axis, i) =>
             calibration.ToJoint(i, bus.GetFeedback(axis.DeviceId)!.PositionRaw)).ToArray();
-        var zeroPlan = MotionPlan.CreateIndependentToZero(robot, calibration, last, 1, 1);
+        var zeroPlan = MotionPlan.CreateSmoothToZero(robot, calibration, last, 1, 1);
         int zeroStart = bus.Frames.Count;
         bus.Refresh(true);
         wbc.Execute(zeroPlan);
@@ -422,6 +424,10 @@ internal static class WholeBodyTests
             "CSP zero return settles without releasing ownership");
         Check(registry.Motors.All(axis => bus.GetFeedback(axis.DeviceId)!.PositionRaw == 0),
             "CSP zero return reaches exactly four zero encoder targets");
+        var zeroFeedback = registry.Motors.Select((axis, i) =>
+            calibration.ToJoint(i, bus.GetFeedback(axis.DeviceId)!.PositionRaw)).ToArray();
+        Check(wbc.MotionStatus.TargetReached && DiskKinematics.Matches(new TaskPose(.066, .972, 0, 0), zeroFeedback),
+            "CSP reports arrival at height 972 mm, fore/aft 66 mm, pitch and yaw zero");
         Check(bus.Frames.Skip(zeroStart).Where(frame => frame.Length == 7).All(frame => frame.Data[0] == 0xC6),
             "CSP zero return sends only enabled CSP position frames");
 
@@ -430,7 +436,7 @@ internal static class WholeBodyTests
             Motors = [new(1, 1, 20), calibration.Motors[1], calibration.Motors[2], calibration.Motors[3]],
         };
         double[] inBounds = [-.1, 0, 0, 0];
-        Reject(() => MotionPlan.CreateIndependentToZero(robot, zeroForbidden, inBounds, 1, 1),
+        Reject(() => MotionPlan.CreateSmoothToZero(robot, zeroForbidden, inBounds, 1, 1),
             "CSP zero return rejects a zero target outside calibration");
 
         bus.Refresh(true);
@@ -755,6 +761,35 @@ internal static class WholeBodyTests
         var narrow = new Calibration { Motors = calibration.Motors, TaskLimits = new() { ForwardLimit = .067, BackwardLimit = 0 } };
         Reject(() => MotionPlan.CreateIndependent(robot, narrow, start, target, 1, 1),
             "rejects an intermediate X excursion even when both endpoints are inside");
+    }
+
+    static void CheckSmoothExecution(Robot robot)
+    {
+        var c = new Calibration { Motors = [new(1,-172,172),new(2,-100,15),new(3,-10,143),new(4,-54,10)] };
+        var bus = new FakeBus();
+        var registry = new MotorRegistry(Path.Combine(Path.GetTempPath(), Guid.NewGuid() + ".json"));
+        var legacy = new MotorController(bus, new KeepaliveScheduler(bus.Send), registry);
+        using var controller = new WholeBodyController(robot, c, bus, registry, legacy, false);
+        double[] low = [0, -88.76953125 * Math.PI / 180, 142.3663330078125 * Math.PI / 180, -53.5968017578125 * Math.PI / 180];
+        bus.SetPosition(c.Encode(robot, low));
+        bus.Refresh(false);
+        controller.Arm(new Dictionary<int,string>());
+        Thread.Sleep(160);
+        long now = MotorFeedback.Now;
+        void Tick() { bus.Refresh(true); controller.Tick(.005, now += 5); }
+        Tick();
+        var plan = MotionPlan.CreateSmooth(robot, c, controller.PlanningStart(), new TaskPose(0,.9,0,0), 8,60);
+        controller.Execute(plan);
+        Tick();
+        Check(controller.MoveLTracking?.Contains("位置跟踪差") == true, "curve uses pose tracking instead of straight-line deviation");
+        for (int i = 0; i < 13000 && controller.State != GroupState.Holding && controller.State != GroupState.FaultLatched; i++) Tick();
+        Check(controller.MotionStatus == (GroupState.Holding, true, false), "smooth curve completes and settles in the existing CSP controller");
+        var reverse = MotionPlan.CreateSmooth(robot, c, controller.PlanningStart(), DiskKinematics.Forward(low), 8,60);
+        controller.Execute(reverse);
+        for (int i = 0; i < 150; i++) Tick();
+        controller.Stop();
+        for (int i = 0; i < 1000 && controller.State != GroupState.Holding && controller.State != GroupState.FaultLatched; i++) Tick();
+        Check(controller.MotionStatus == (GroupState.Holding, false, true), "smooth curve stops on its path and reports an early stop");
     }
 
     sealed class FakeBus:ICanTransport
