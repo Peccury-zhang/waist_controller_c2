@@ -3,7 +3,7 @@ namespace WaistModel;
 public readonly record struct MoveLWorkspace(double MinimumHeightMm, double MaximumHeightMm)
 {
     public const double ZeroHeightMm = 972;
-    public const double ReferenceMinimumMm = 438;
+    public const double ReferenceMinimumMm = 466;
 
     public static MoveLWorkspace FromCalibration(Calibration calibration)
         => FromPlanningLimits(calibration.CreateWholeBodyPlanningLimits());
@@ -74,8 +74,7 @@ public readonly record struct MoveLWorkspace(double MinimumHeightMm, double Maxi
 
         if (lowest is not { } floor) throw new ArgumentException("当前标定下没有中性姿态的可用高度");
         double minimum = Math.Ceiling(floor.Z * 1000 - 1e-8);
-        // The normal workspace retains the reference low-pose restriction if a
-        // new calibration box would permit a deeper fold.
+        // The tested operating floor still applies if the geometry permits a deeper fold.
         minimum = Math.Max(ReferenceMinimumMm, minimum);
         return new(minimum, ZeroHeightMm);
     }

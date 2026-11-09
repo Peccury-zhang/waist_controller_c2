@@ -12,13 +12,21 @@ public sealed class WholeBodyPage:UserControl
     readonly NumericUpDown[] target=new NumericUpDown[4];readonly Label[] actual=new Label[4];readonly Label status=new(){AutoSize=true},hint=new(){AutoSize=true};
     readonly NumericUpDown positionStep = new() { Minimum = .1m, Maximum = 100, Value = 10, Increment = 5, DecimalPlaces = 1 };
     readonly NumericUpDown angleStep = new() { Minimum = .1m, Maximum = 30, Value = 2, Increment = 1, DecimalPlaces = 1 };
-    readonly NumericUpDown maxSpeed = NewOutputLimit();
-    readonly NumericUpDown maxAcceleration = NewOutputLimit();
+    readonly NumericUpDown maxSpeed = NewOutputLimit(MotionPlan.MaximumOutputSpeedRpm, 5);
+    readonly NumericUpDown maxAcceleration = NewOutputLimit(MotionPlan.MaximumOutputAccelerationRpmPerSec, 30);
     readonly List<Button> motion=new();readonly System.Windows.Forms.Timer timer=new(){Interval=50};readonly CancellationTokenSource lifetime=new();CancellationTokenSource? operation;
-    readonly Action<string> logFailure;
+    readonly Action<string> log;
+    private readonly Button recordingButton;
+    private readonly Button parkingRecoveryButton;
+    private readonly WholeBodyPointsPanel points;
+    private readonly Label recordingStatus = new() { Dock = DockStyle.Fill, AutoEllipsis = true, TextAlign = ContentAlignment.MiddleLeft };
+    private CspTrace? recordingToSave;
+    private bool savingRecording;
     private bool fillingTargets;
+    private bool pendingActualTargets = true;
+    private bool showingParkingStatus;
     private int editedTargetAxes;
-    private MoveLWorkspace? workspace;
+    private Calibration? targetCalibration;
     private string? workspaceVersion;
     private Label heightTitle = null!;
     private Label frontTitle = null!;
@@ -32,66 +40,101 @@ public sealed class WholeBodyPage:UserControl
         string root=Path.Combine(Application.StartupPath,"assets","robot");model=Robot.Load(Path.Combine(root,"urdf","urdf_g3_06.urdf"),Path.Combine(root,"meshes"));controller=new(model,new Calibration(),bus,registry,legacy);
         view = new RobotView(model, () => RunUiAction(ReadCurrent)) { Dock = DockStyle.Fill };
         controller.Log += log;
-        logFailure = message => log("全身运控请求未执行 · " + message);
+        this.log = log;
         var split=new TableLayoutPanel{Dock=DockStyle.Fill,ColumnCount=2,RowCount=1,Padding=new(12)};split.ColumnStyles.Add(new(SizeType.Percent,33.333f));split.ColumnStyles.Add(new(SizeType.Percent,66.667f));Controls.Add(split);
         split.Controls.Add(view, 0, 0);
-        var right = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 7, Padding = new(16) };
-        var cardsRow = new RowStyle(SizeType.Absolute, 240);
-        right.RowStyles.Add(new(SizeType.Absolute, 26));
-        right.RowStyles.Add(cardsRow);
-        right.RowStyles.Add(new(SizeType.Absolute, 36));
-        right.RowStyles.Add(new(SizeType.Absolute, 36));
-        right.RowStyles.Add(new(SizeType.Absolute, 58));
-        right.RowStyles.Add(new(SizeType.Absolute, 36));
-        right.RowStyles.Add(new(SizeType.Percent, 100));
-        split.Controls.Add(right, 1, 0);
-        right.Controls.Add(status, 0, 0);
-        var cardsHost = new Panel { Dock = DockStyle.Fill, AutoScroll = true, Margin = Padding.Empty };
-        var cards = new TableLayoutPanel { Dock = DockStyle.Top, ColumnCount = 2, RowCount = 2 };
+        var rightHost = new BufferedPanel { Dock = DockStyle.Fill, AutoScroll = true };
+        var sections = new TableLayoutPanel { Dock = DockStyle.Top, ColumnCount = 1, RowCount = 2, Padding = new(4) };
+        sections.RowStyles.Add(new(SizeType.Absolute, 354));
+        sections.RowStyles.Add(new(SizeType.Percent, 100));
+        rightHost.Controls.Add(sections);
+        split.Controls.Add(rightHost, 1, 0);
+        void ResizeSections()
+        {
+            int height = Math.Max(rightHost.ClientSize.Height, 518 * rightHost.DeviceDpi / 96);
+            if (sections.Height != height) sections.Height = height;
+            rightHost.AutoScrollMinSize = new Size(0, height);
+        }
+        rightHost.ClientSizeChanged += (_, _) => ResizeSections();
+        rightHost.DpiChangedAfterParent += (_, _) => ResizeSections();
+        var controlsFrame = new SurfacePanel { Dock = DockStyle.Fill, Margin = new Padding(0, 0, 0, 8), Padding = new(10, 6, 10, 6) };
+        sections.Controls.Add(controlsFrame, 0, 0);
+        var right = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 7 };
+        foreach (int rowHeight in new[] { 50, 116, 29, 29, 42, 31, 31 })
+            right.RowStyles.Add(new(SizeType.Absolute, rowHeight));
+        controlsFrame.Controls.Add(right);
+
+        var header = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 3, RowCount = 2, Margin = Padding.Empty };
+        header.ColumnStyles.Add(new(SizeType.Percent, 100));
+        header.ColumnStyles.Add(new(SizeType.Absolute, 150));
+        header.ColumnStyles.Add(new(SizeType.Absolute, 150));
+        header.RowStyles.Add(new(SizeType.Absolute, 22));
+        header.RowStyles.Add(new(SizeType.Percent, 100));
+        header.Controls.Add(new Label { Text = "位姿控制", AutoSize = true, ForeColor = UiTheme.Text,
+            Font = UiTheme.Font(12, FontStyle.Bold) }, 0, 0);
+        status.Font = UiTheme.Font(9.5f);
+        header.Controls.Add(status, 0, 1);
+        parkingRecoveryButton = CommandButton("停车区退让", ActionKind.Secondary, () => _ = RunAsync(recoverParking: true));
+        parkingRecoveryButton.Anchor = AnchorStyles.Right;
+        parkingRecoveryButton.Size = new Size(140, 32);
+        parkingRecoveryButton.Enabled = false;
+        header.Controls.Add(parkingRecoveryButton, 1, 0);
+        header.SetRowSpan(parkingRecoveryButton, 2);
+        recordingButton = CommandButton("录制跟踪", ActionKind.Secondary, ToggleRecording);
+        recordingButton.Anchor = AnchorStyles.Right;
+        recordingButton.Size = new Size(140, 32);
+        recordingButton.Enabled = false;
+        header.Controls.Add(recordingButton, 2, 0);
+        header.SetRowSpan(recordingButton, 2);
+        right.Controls.Add(header, 0, 0);
+
+        var cards = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 2, Margin = Padding.Empty };
         for (int i = 0; i < 2; i++)
         {
             cards.ColumnStyles.Add(new(SizeType.Percent, 50));
             cards.RowStyles.Add(new(SizeType.Percent, 50));
         }
-        int MinimumCardsHeight() => 240 * cardsHost.DeviceDpi / 96;
-        void ResizeCards() => cards.Height = Math.Max(cardsHost.ClientSize.Height, MinimumCardsHeight());
-        void FitCardsRow()
-        {
-            int reserved = right.RowStyles.Cast<RowStyle>()
-                .Where(row => row != cardsRow && row.SizeType == SizeType.Absolute)
-                .Sum(row => (int)row.Height);
-            int available = Math.Max(0, right.ClientSize.Height - right.Padding.Vertical - reserved);
-            int height = Math.Min(available, Math.Max(available * 2 / 3, MinimumCardsHeight()));
-            if (cardsRow.Height != height) cardsRow.Height = height;
-        }
-        cardsHost.ClientSizeChanged += (_, _) => ResizeCards();
-        cardsHost.DpiChangedAfterParent += (_, _) => ResizeCards();
-        cardsHost.Controls.Add(cards);
-        right.Controls.Add(cardsHost, 0, 1);
-        right.Layout += (_, _) => FitCardsRow();
-        FitCardsRow();
-        ResizeCards();
+        right.Controls.Add(cards, 0, 1);
         string[] names=["高度 · mm","前后 · mm","俯仰 · °","航向 · °"];string[] minus=["降低 −","后退 −","后仰 −","航向 −"],plus=["升高 +","前进 +","前倾 +","航向 +"];double[] initial=[972,66,0,0];
         for(int i=0;i<4;i++)
         {
-            int axis=i;var card=new TableLayoutPanel{Dock=DockStyle.Fill,ColumnCount=1,RowCount=4,Padding=new(12,6,12,6),Margin=new(4),BackColor=Color.FromArgb(34,41,53)};
-            var title = new Label { Text = names[i], AutoSize = true, Font = new Font(Font.FontFamily, 13, FontStyle.Bold) };
+            int axis=i;
+            var card = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2,
+                Padding = new(7, 2, 7, 2), Margin = new(3), BackColor = Color.FromArgb(34, 41, 53) };
+            card.RowStyles.Add(new(SizeType.Absolute, 20));
+            card.RowStyles.Add(new(SizeType.Percent, 100));
+            var cardHeader = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1, Margin = Padding.Empty };
+            cardHeader.RowStyles.Add(new(SizeType.Percent, 100));
+            cardHeader.ColumnStyles.Add(new(SizeType.Percent, 60));
+            cardHeader.ColumnStyles.Add(new(SizeType.Percent, 40));
+            var title = new Label { Text = names[i], Dock = DockStyle.Fill, AutoEllipsis = true, Font = UiTheme.Font(10, FontStyle.Bold), Margin = Padding.Empty };
             if (axis == 0) heightTitle = title;
             if (axis == 1) frontTitle = title;
-            card.Controls.Add(title,0,0);actual[i]=new(){Text="实际 —",AutoSize=true};card.Controls.Add(actual[i],0,1);
+            cardHeader.Controls.Add(title, 0, 0);
+            actual[i] = new() { Text = "实际 —", Dock = DockStyle.Fill, AutoEllipsis = true, Font = UiTheme.Font(9),
+                Margin = Padding.Empty, TextAlign = ContentAlignment.MiddleRight };
+            cardHeader.Controls.Add(actual[i], 1, 0);
+            card.Controls.Add(cardHeader, 0, 0);
+            var editor = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 3, RowCount = 1, Margin = Padding.Empty };
+            editor.RowStyles.Add(new(SizeType.Percent, 100));
+            editor.ColumnStyles.Add(new(SizeType.Percent, 100));
+            editor.ColumnStyles.Add(new(SizeType.Absolute, 67));
+            editor.ColumnStyles.Add(new(SizeType.Absolute, 67));
             target[i]=new(){Minimum=i==0?(decimal)MoveLWorkspace.ReferenceMinimumMm:i==1?-2000:-180,
                 Maximum=i==0?(decimal)MoveLWorkspace.ZeroHeightMm:i==1?2000:180,
-                Value=(decimal)initial[i],DecimalPlaces=2,Dock=DockStyle.Top};card.Controls.Add(target[i],0,2);
+                Value=(decimal)initial[i],DecimalPlaces=2,Anchor=AnchorStyles.Left|AnchorStyles.Right,
+                Font=UiTheme.Font(10),Margin=new Padding(0,0,4,0)};
+            editor.Controls.Add(target[i], 0, 0);
             target[i].ValueChanged += (_, _) => TargetEdited(axis);
-            var buttons = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true };
             foreach (int direction in new[] { -1, 1 })
             {
                 int delta = direction;
                 var button = JogButton(direction < 0 ? minus[i] : plus[i], () => _ = RunAsync(axis, delta));
+                button.Dock = DockStyle.Fill;
                 motion.Add(button);
-                buttons.Controls.Add(button);
+                editor.Controls.Add(button, direction < 0 ? 1 : 2, 0);
             }
-            card.Controls.Add(buttons, 0, 3);
+            card.Controls.Add(editor, 0, 1);
             cards.Controls.Add(card, i % 2, i / 2);
         }
         var steps=new FlowLayoutPanel{Dock=DockStyle.Fill};steps.Controls.AddRange([new Label{Text="位置步长 mm",AutoSize=true},positionStep,new Label{Text="角度步长 °",AutoSize=true},angleStep]);right.Controls.Add(steps,0,2);
@@ -101,28 +144,100 @@ public sealed class WholeBodyPage:UserControl
             new Label { Text = "最大加速度 rpm/s", AutoSize = true }, maxAcceleration,
         ]);
         right.Controls.Add(limits, 0, 3);
-        var commands = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 3, RowCount = 1 };
+        var commands = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 3, RowCount = 1, Margin = Padding.Empty };
+        commands.RowStyles.Add(new(SizeType.Percent, 100));
         for (int i = 0; i < 3; i++) commands.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f / 3));
         var execute = CommandButton("执行到位姿", ActionKind.Primary, () => _ = RunAsync());
         var returnToZero = CommandButton("CSP回零位", ActionKind.Primary, () => _ = RunAsync(returnToZero: true));
         motion.Add(execute);
         motion.Add(returnToZero);
+        var stop = CommandButton("停止并退出 CSP", ActionKind.Danger, StopAndExit);
+        foreach (var button in new[] { execute, stop, returnToZero }) button.Dock = DockStyle.Fill;
         commands.Controls.Add(execute, 0, 0);
-        commands.Controls.Add(CommandButton("停止并退出 CSP", ActionKind.Danger, StopAndExit), 1, 0);
+        commands.Controls.Add(stop, 1, 0);
         commands.Controls.Add(returnToZero, 2, 0);
         right.Controls.Add(commands, 0, 4);
         right.Controls.Add(hint, 0, 5);
+        right.Controls.Add(recordingStatus, 0, 6);
+
+        string pointsPath = Path.Combine(Path.GetDirectoryName(Store.FilePath)!, "waypoints.json");
+        points = new WholeBodyPointsPanel(new WholeBodyPointStore(pointsPath), () => Store.Load(Signs()),
+            CapturePointPose, point => _ = RunAsync(point: point)) { Dock = DockStyle.Fill, Margin = Padding.Empty };
+        sections.Controls.Add(points, 0, 1);
+        ResizeSections();
+        VisibleChanged += (_, _) =>
+        {
+            pendingActualTargets = true;
+            if (Visible) { points.Reload(); RefreshScene(); }
+        };
         timer.Tick+=(_,_)=>RefreshScene();timer.Start();
     }
-    private static NumericUpDown NewOutputLimit() => new()
+    private static NumericUpDown NewOutputLimit(decimal maximum, decimal initial) => new()
     {
         Minimum = MotionPlan.MinimumOutputLimit,
-        Maximum = MotionPlan.MaximumOutputLimit,
-        Value = 1,
+        Maximum = maximum,
+        Value = initial,
         Increment = .1m,
         DecimalPlaces = 2,
         Width = 100,
     };
+
+    private void ToggleRecording()
+    {
+        if (recordingToSave is not null || controller.RecordingComplete.HasValue)
+        {
+            _ = SaveRecordingAsync();
+            return;
+        }
+        controller.StartRecording();
+        recordingStatus.Text = "录制中 · 最多约 2 分钟";
+        UpdateRecordingButton();
+    }
+
+    private void UpdateRecordingButton()
+    {
+        bool hasRecording = controller.RecordingComplete.HasValue;
+        recordingButton.Text = savingRecording ? "正在保存…" : recordingToSave is not null ? "重试保存"
+            : hasRecording ? "停止并保存" : "录制跟踪";
+        recordingButton.Enabled = !savingRecording && (recordingToSave is not null || hasRecording
+            || (bus.IsOpen && controller.State != GroupState.FaultLatched));
+    }
+
+    private async Task SaveRecordingAsync()
+    {
+        if (savingRecording) return;
+        recordingToSave ??= controller.TakeRecording();
+        if (recordingToSave is not { } capture) return;
+        if (capture.Count == 0)
+        {
+            recordingToSave = null;
+            recordingStatus.Text = "未采集到 CSP 数据，请先录制再执行";
+            UpdateRecordingButton();
+            return;
+        }
+
+        savingRecording = true;
+        recordingStatus.Text = "正在保存跟踪曲线…";
+        UpdateRecordingButton();
+        try
+        {
+            string directory = Path.Combine(Application.StartupPath, "logs", "traces");
+            string path = await Task.Run(() => capture.Save(directory));
+            recordingToSave = null;
+            recordingStatus.Text = $"已保存 · {Path.GetFileName(path)}";
+            log($"CSP 跟踪录制已保存 · {path}");
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            recordingStatus.Text = "保存失败，数据仍在内存中，可重试保存";
+            log($"CSP 跟踪录制保存失败 · {e.Message}");
+        }
+        finally
+        {
+            savingRecording = false;
+            if (!IsDisposed) UpdateRecordingButton();
+        }
+    }
 
     private Button CommandButton(string label, ActionKind kind, Action action)
     {
@@ -158,15 +273,34 @@ public sealed class WholeBodyPage:UserControl
         button.Click += (_, _) => RunUiAction(action);
         return button;
     }
-    static string StateLabel(GroupState s)=>s switch {GroupState.Observing=>"空闲",GroupState.Arming=>"准备中",GroupState.Holding=>"保持 / 已到位",GroupState.Executing=>"执行中",GroupState.Stopping=>"正在停止",GroupState.Settling=>"等待到位",GroupState.Disarming=>"正在退出 CSP",_=>"故障"};
-    int[] Signs()=>registry.Motors.Select(m=>m.Direction).ToArray();
-    double[] ReadFeedback()
+    internal static string StateLabel(GroupState state, bool targetReached, bool stoppedBeforeTarget) => state switch
     {
-        var f=registry.Motors.Select(m=>bus.GetFeedback(m.DeviceId)).ToArray();long now=MotorFeedback.Now;
-        if(!bus.IsOpen||f.Any(x=>x==null||now-x.Timestamp>100||x.Timestamp>now||x.HasError||x.FaultCode!=0))throw new InvalidOperationException("请连接设备并等待四轴有效反馈");
-        var signs = Signs();
-        return f.Select((x, i) => Calibration.FeedbackToUrdf(i, x!.PositionRaw, signs[i])).ToArray();
+        GroupState.Observing => "空闲",
+        GroupState.Arming => "准备中",
+        GroupState.Holding when targetReached => "保持 / 已到位",
+        GroupState.Holding when stoppedBeforeTarget => "保持 / 提前停止",
+        GroupState.Holding => "保持",
+        GroupState.Executing => "执行中",
+        GroupState.Stopping => "正在停止",
+        GroupState.Settling when stoppedBeforeTarget => "等待停稳",
+        GroupState.Settling => "等待到位",
+        GroupState.Disarming => "正在退出 CSP",
+        _ => "故障",
+    };
+    int[] Signs()=>registry.Motors.Select(m=>m.Direction).ToArray();
+    private MotorFeedback[] ReadMotorFeedback()
+    {
+        const string unavailable = "请连接设备并等待四轴有效反馈";
+        if (!bus.IsOpen) throw new InvalidOperationException(unavailable);
+        var feedback = registry.Motors.Select(m => bus.GetFeedback(m.DeviceId) ?? throw new InvalidOperationException(unavailable)).ToArray();
+        long now = MotorFeedback.Now;
+        if (feedback.Any(axis => now - axis.Timestamp > 100 || axis.Timestamp > now || axis.HasError || axis.FaultCode != 0))
+            throw new InvalidOperationException(unavailable);
+        return feedback;
     }
+    private static double[] ToUrdfJoints(MotorFeedback[] feedback, int[] signs) =>
+        feedback.Select((axis, i) => Calibration.FeedbackToUrdf(i, axis.PositionRaw, signs[i])).ToArray();
+    private double[] ReadFeedback() => ToUrdfJoints(ReadMotorFeedback(), Signs());
     static double[] Values(TaskPose p)=>[p.Z*1000,p.X*1000,p.Pitch*180/Math.PI,p.Yaw*180/Math.PI];
     void Fill(TaskPose pose)
     {
@@ -183,6 +317,7 @@ public sealed class WholeBodyPage:UserControl
     {
         if (Busy) throw new InvalidOperationException("请等待全身运控动作结束");
         Fill(DiskKinematics.Forward(ReadFeedback()));
+        pendingActualTargets = false;
         editedTargetAxes = 0;
         UpdateFrontTitle();
         hint.Text = "当前位姿已填入目标栏";
@@ -192,27 +327,29 @@ public sealed class WholeBodyPage:UserControl
     {
         if (fillingTargets) return;
         editedTargetAxes |= 1 << axis;
+        if (axis == 0) editedTargetAxes &= ~(1 << 1);
         UpdateFrontTitle();
-        if (axis == 1 || (editedTargetAxes & 3) != 1 || workspace is not { } range) return;
+        if (axis != 1) UpdateCenteredFront();
+    }
+
+    private void UpdateCenteredFront()
+    {
+        if ((editedTargetAxes & 3) != 1) return;
+        if (targetCalibration is not { } calibration)
+        {
+            frontTitle.Text = "前后 · 未标定";
+            return;
+        }
         try
         {
-            var calibration = Store.Load(Signs());
-            var start = ReadFeedback();
-            var pose = DiskKinematics.Forward(start);
-            var request = pose with
-            {
-                Z = (double)target[0].Value / 1000,
-                Pitch = (editedTargetAxes & 4) != 0 ? (double)target[2].Value * Math.PI / 180 : pose.Pitch,
-                Yaw = (editedTargetAxes & 8) != 0 ? (double)target[3].Value * Math.PI / 180 : pose.Yaw,
-            };
-            range.CheckHeight(request.Z);
-            double suggested = MotionPlan.SuggestCenteredX(calibration, start, request) * 1000;
+            var (pose, _) = MotionPlan.ResolveCenteredEndpoint(calibration, ReadTargetPose());
             fillingTargets = true;
-            target[1].Value = Math.Clamp(Math.Round((decimal)suggested, 2), target[1].Minimum, target[1].Maximum);
+            target[1].Value = Math.Clamp((decimal)(pose.X * 1000), target[1].Minimum, target[1].Maximum);
+            UpdateFrontTitle();
         }
-        catch (Exception e) when (e is ArgumentException or InvalidOperationException or InvalidDataException or IOException)
+        catch (ArgumentException)
         {
-            frontTitle.Text = "前后 · 待规划 mm";
+            frontTitle.Text = "前后 · 无可用自动值";
         }
         finally { fillingTargets = false; }
     }
@@ -228,20 +365,23 @@ public sealed class WholeBodyPage:UserControl
     {
         if (version == workspaceVersion) return;
         workspaceVersion = version;
-        workspace = null;
+        targetCalibration = calibration;
         heightTitle.Text = "高度 · mm";
         fillingTargets = true;
         try
         {
-            if (calibration is null) return;
-            target[1].Minimum = (decimal)(-1000 * calibration.TaskLimits.BackwardLimit);
-            target[1].Maximum = (decimal)(1000 * calibration.TaskLimits.ForwardLimit);
-            workspace = MoveLWorkspace.FromCalibration(calibration);
-            target[0].Minimum = (decimal)workspace.Value.MinimumHeightMm;
-            heightTitle.Text = $"高度 · {workspace.Value.MinimumHeightMm:F0}～{workspace.Value.MaximumHeightMm:F0} mm";
+            if (calibration is not null)
+            {
+                target[1].Minimum = (decimal)(-1000 * calibration.TaskLimits.BackwardLimit);
+                target[1].Maximum = (decimal)(1000 * calibration.TaskLimits.ForwardLimit);
+                var workspace = MoveLWorkspace.FromCalibration(calibration);
+                target[0].Minimum = (decimal)workspace.MinimumHeightMm;
+                heightTitle.Text = $"高度 {workspace.MinimumHeightMm:F0}～{workspace.MaximumHeightMm:F0} mm";
+            }
         }
         catch (ArgumentException e) { hint.Text = e.Message; }
         finally { fillingTargets = false; }
+        UpdateCenteredFront();
     }
 
     void StopAndExit()
@@ -253,60 +393,103 @@ public sealed class WholeBodyPage:UserControl
         hint.Text = exiting ? "正在停止并退出 CSP…" : "当前未占用 CSP";
     }
 
-    async Task RunAsync(int axis = -1, int direction = 0, bool returnToZero = false)
+    private TaskPose JogRequest(int axis, int direction)
+    {
+        decimal next = target[axis].Value + direction * (axis < 2 ? positionStep.Value : angleStep.Value);
+        if (next < target[axis].Minimum || next > target[axis].Maximum)
+            throw new InvalidOperationException("目标超出输入范围，请调整目标或步长");
+        target[axis].Value = next;
+        return ReadTargetPose();
+    }
+
+    private TaskPose ReadTargetPose() => new((double)target[1].Value / 1000, (double)target[0].Value / 1000,
+        (double)target[2].Value * Math.PI / 180, (double)target[3].Value * Math.PI / 180);
+
+    private (TaskPose Pose, string Source) CapturePointPose()
+    {
+        if (Busy) throw new InvalidOperationException("请等待全身运控动作结束");
+        try { return (DiskKinematics.Forward(ReadFeedback()), "已填入当前实测高度、俯仰和航向，可修改"); }
+        catch (InvalidOperationException)
+        {
+            return (new TaskPose(0, (double)target[0].Value / 1000, (double)target[2].Value * Math.PI / 180,
+                (double)target[3].Value * Math.PI / 180), "当前无实时反馈，已填入上方位姿目标，可修改");
+        }
+    }
+
+    async Task RunAsync(int axis = -1, int direction = 0, bool returnToZero = false, bool recoverParking = false,
+        WholeBodyPoint? point = null)
     {
         if(Busy)return;planning=true;operation?.Dispose();operation=CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);var token=operation.Token;
         try
         {
             if (controller.State == GroupState.FaultLatched)
                 throw new InvalidOperationException("请先点击“停止并退出 CSP”，确认四轴失能抱闸");
-            var calibration=Store.Load(Signs());var start=ReadFeedback();
+            if (!recoverParking && controller.InParkingZone)
+                throw new InvalidOperationException("停车区锁定，回到规划区并停稳后再执行");
+            var calibration = Store.Load(Signs());
+            var measuredStart = ReadFeedback();
+            if (recoverParking && !controller.CanRecoverParking)
+                throw new InvalidOperationException("退让需要有效的 CSP 保持指令，请先确认四轴已停稳");
+            var start = controller.Owns ? controller.PlanningStart() : measuredStart;
+            if (pendingActualTargets)
+            {
+                Fill(DiskKinematics.Forward(start));
+                pendingActualTargets = false;
+                editedTargetAxes = 0;
+                UpdateFrontTitle();
+            }
             try { calibration.Check(start); }
             catch (ArgumentException e) { throw new InvalidOperationException("起点超限 · " + e.Message, e); }
+            if (!recoverParking) calibration.CheckWholeBodyStart(start);
             TaskPose request;
-            PositionPriority priority = axis switch
+            PositionPriority priority = PositionPriority.Both;
+            if (recoverParking)
             {
-                0 => PositionPriority.Height,
-                1 => PositionPriority.ForeAft,
-                -1 when !returnToZero && (editedTargetAxes & 3) == 1 => PositionPriority.Height,
-                -1 when !returnToZero && (editedTargetAxes & 3) == 2 => PositionPriority.ForeAft,
-                _ => PositionPriority.Both,
-            };
-            if (returnToZero)
+                request = default;
+                hint.Text = "正在验证低速向内退让…";
+            }
+            else if (returnToZero)
             {
                 request = DiskKinematics.Forward(new double[4]);
                 hint.Text = "正在验证 CSP 回零路径…";
             }
+            else if (point is not null)
+            {
+                request = point.Pose;
+                hint.Text = $"正在规划点位「{point.Name}」…";
+            }
             else
             {
-                var t = target.Select(n => (double)n.Value).ToArray();
-                var actualValues = Values(DiskKinematics.Forward(start));
-                if (axis >= 0)
+                request = axis >= 0 ? JogRequest(axis, direction) : ReadTargetPose();
+                if (axis < 0 && (editedTargetAxes & 3) == 0)
                 {
-                    t = actualValues;
-                    t[axis] += direction * (double)(axis < 2 ? positionStep.Value : angleStep.Value);
+                    var current = DiskKinematics.Forward(start);
+                    bool orientationOnly = (editedTargetAxes & 12) != 0;
+                    request = request with
+                    {
+                        X = orientationOnly ? current.X : request.X,
+                        Z = orientationOnly ? current.Z : request.Z,
+                        Pitch = (editedTargetAxes & 4) != 0 ? request.Pitch : current.Pitch,
+                        Yaw = (editedTargetAxes & 8) != 0 ? request.Yaw : current.Yaw,
+                    };
                 }
-                else
-                {
-                    if ((editedTargetAxes & 3) == 0 && (editedTargetAxes & 12) != 0)
-                        Array.Copy(actualValues, t, 2);
-                    for (int i = 2; i < 4; i++)
-                        if ((editedTargetAxes & (1 << i)) == 0) t[i] = actualValues[i];
-                }
-                request = new TaskPose(t[1] / 1000, t[0] / 1000, t[2] * Math.PI / 180, t[3] * Math.PI / 180);
+                if ((editedTargetAxes & 3) == 1) priority = PositionPriority.Height;
                 hint.Text = "正在规划并验证 MoveL 直线…";
             }
             foreach (var input in target) input.Enabled = false;
             double speed = (double)maxSpeed.Value, acceleration = (double)maxAcceleration.Value;
-            var plan = await Task.Run(() => returnToZero
+            var plan = await Task.Run(() => recoverParking
+                ? MotionPlan.CreateParkingRecovery(model, calibration, start, measuredStart, token)
+                : returnToZero
                 ? MotionPlan.CreateIndependentToZero(model, calibration, start, speed, acceleration, token)
                 : MotionPlan.CreateMoveL(model, calibration, start, request, speed, acceleration, token, priority), token);
             token.ThrowIfCancellationRequested();if(Store.Load(Signs()).Fingerprint!=calibration.Fingerprint)throw new InvalidOperationException("标定已变化，请重新执行");
-            var fresh=ReadFeedback();if(fresh.Where((q,i)=>Math.Abs(q-start[i])>.001).Any())throw new InvalidOperationException("规划期间起点变化，请重新执行");
+            var fresh=ReadFeedback();if(fresh.Where((q,i)=>Math.Abs(q-measuredStart[i])>.001).Any())throw new InvalidOperationException("规划期间起点变化，请重新执行");
             controller.SetCalibration(calibration);
             signature=calibration.Fingerprint;
             if (!controller.Owns)
             {
+                if (recoverParking) throw new InvalidOperationException("CSP 保持已结束，请重新检查");
                 var versions = firmware();
                 long deadline = Environment.TickCount64 + 150;
                 while (true)
@@ -325,18 +508,30 @@ public sealed class WholeBodyPage:UserControl
             string adjustment = "";
             if (priority == PositionPriority.Height && Math.Abs(resolved.X - request.X) > .000005)
                 adjustment = $"前后调整为 {resolved.X * 1000:F2} mm · ";
-            else if (priority == PositionPriority.ForeAft && Math.Abs(resolved.Z - request.Z) > .000005)
-                adjustment = $"高度调整为 {resolved.Z * 1000:F2} mm · ";
-            Fill(resolved with { Yaw = DiskKinematics.Wrap(resolved.Yaw) });
-            if (axis >= 0 || returnToZero) editedTargetAxes = axis == 0 ? 1 : 0;
-            UpdateFrontTitle();
-            hint.Text = returnToZero
+            if (!recoverParking)
+            {
+                Fill(resolved with { Yaw = DiskKinematics.Wrap(resolved.Yaw) });
+                if (point is not null) editedTargetAxes = 15;
+                else if (returnToZero) editedTargetAxes = 0;
+                else if (axis >= 0) editedTargetAxes &= 3;
+                UpdateFrontTitle();
+            }
+            hint.Text = recoverParking
+                ? $"停车区退让 · 预计 {plan.Duration:F2}s · 速度上限 0.10 rpm"
+                : returnToZero
                 ? $"CSP回零位 · 四轴目标 0° · 最长指令轨迹 {plan.Duration:F2}s"
                 : $"{adjustment}MoveL · 预计 {plan.Duration:F2}s" +
                     (plan.MoveLLimitingConstraint is { } limit ? $" · {limit}" : "");
+            string limits = recoverParking ? " · 退让加速度上限 0.50 rpm/s"
+                : $" · 规划速度上限 {speed:F2} rpm · 规划加速度上限 {acceleration:F2} rpm/s";
+            if (plan.ExpectedMoveLPose(0) is not null)
+                limits += $" · 计划关节峰值约 {plan.MoveLPlannedPeakRpm:F2} rpm";
+            if (point is not null) hint.Text = $"点位「{point.Name}」 · {hint.Text}";
+            log($"全身运控 · {hint.Text}{limits}"
+                + $" · 起点高度 {DiskKinematics.Forward(start).Z * 1000:F2} mm · 目标高度 {resolved.Z * 1000:F2} mm");
         }
         catch(OperationCanceledException){if(!exiting)hint.Text="已取消当前请求";}
-        catch(Exception e){hint.Text=e.Message;logFailure(e.Message);}
+        catch(Exception e){hint.Text=e.Message;log("全身运控请求未执行 · " + e.Message);}
         finally
         {
             planning = false;
@@ -345,32 +540,68 @@ public sealed class WholeBodyPage:UserControl
     }
     void RefreshScene()
     {
+        if (controller.RecordingComplete == true) _ = SaveRecordingAsync();
+        UpdateRecordingButton();
         Calibration? c=null;try{c=Store.Load(Signs());}catch{}
         string? fingerprint = c?.Fingerprint;
         UpdateWorkspace(c, fingerprint);
-        var state = controller.State;
-        if(state != GroupState.Disarming && controller.PollsFeedback&&(fingerprint==null||fingerprint!=signature)){operation?.Cancel();controller.Emergency();}
-        foreach(var b in motion)b.Enabled=c!=null&&!Busy&&bus.IsOpen;
-        foreach (var input in target) input.Enabled = !Busy;
+        if(controller.State != GroupState.Disarming && controller.PollsFeedback&&(fingerprint==null||fingerprint!=signature)){operation?.Cancel();controller.Emergency();}
+        var (state, targetReached, stoppedBeforeTarget) = controller.MotionStatus;
+        bool parked = controller.InParkingZone;
         var tracking = controller.MoveLTracking;
-        status.Text=$"{(c==null?"当前未标定":$"已标定 · 前后 {-c.TaskLimits.BackwardLimit*1000:F0}～{c.TaskLimits.ForwardLimit*1000:F0}mm")} · {StateLabel(controller.State)}";
+        status.Text=$"{(c==null?"当前未标定":$"已标定 · 前后 {-c.TaskLimits.BackwardLimit*1000:F0}～{c.TaskLimits.ForwardLimit*1000:F0}mm")} · {StateLabel(state, targetReached, stoppedBeforeTarget)}";
+        if (parked) status.Text += " · 停车区";
         if (tracking is not null) status.Text += Environment.NewLine + tracking;
-        if(!Visible)return;bool stale=false;try{measured=ReadFeedback();var p=Values(DiskKinematics.Forward(measured));for(int i=0;i<4;i++)actual[i].Text=$"实际 {p[i]:F2}";}catch{stale=true;foreach(var l in actual)l.Text="实际 —（未连接/陈旧）";}
+        if(!Visible)return;bool stale=false;
+        double[]? anglesDeg = null;
+        try
+        {
+            var feedback = ReadMotorFeedback();
+            var signs = Signs();
+            anglesDeg = feedback.Select((axis, i) => axis.PositionRaw == 0 ? 0 : signs[i] * axis.PositionDeg).ToArray();
+            measured = ToUrdfJoints(feedback, signs);
+            var pose = DiskKinematics.Forward(measured);
+            var p = Values(pose);
+            for (int i = 0; i < 4; i++) actual[i].Text = $"实际 {p[i]:F2}";
+            if (pendingActualTargets && !Busy)
+            {
+                Fill(pose);
+                editedTargetAxes = 0;
+                pendingActualTargets = false;
+                UpdateFrontTitle();
+            }
+        }
+        catch { stale = true; foreach (var l in actual) l.Text = "实际 · 无反馈"; }
+        bool ready = !Busy && !stale && !pendingActualTargets;
+        bool calibrated = ready && c is not null && bus.IsOpen;
+        bool canRun = calibrated && !parked && state is GroupState.Observing or GroupState.Holding;
+        foreach (var b in motion) b.Enabled = canRun;
+        points.SetAvailability(canRun, !Busy && c is not null, !Busy);
+        parkingRecoveryButton.Enabled = calibrated && controller.CanRecoverParking;
+        foreach (var input in target) input.Enabled = ready;
+        view.UpdateJointFeedback(anglesDeg);
         try{view.UpdatePose(measured,goal,stale);}catch(Exception e){controller.Stop();hint.Text=e.Message;}
-        if (state == GroupState.FaultLatched || (exiting && state != GroupState.Observing))
+        bool showParking = parked && state == GroupState.Holding;
+        if (state == GroupState.FaultLatched || (exiting && state != GroupState.Observing) ||
+            (!planning && (stoppedBeforeTarget || showParking || (showingParkingStatus && state == GroupState.Holding))))
             hint.Text = controller.Status;
         else if (exiting)
         {
             exiting = false;
             hint.Text = "已失能抱闸并退出 CSP";
         }
+        showingParkingStatus = showParking;
     }
     public bool PrepareClose()
     {
         operation?.Cancel();
-        if (!controller.Owns) return true;
-        StopAndExit();
-        return false;
+        if (controller.Owns)
+        {
+            StopAndExit();
+            return false;
+        }
+        if (controller.RecordingComplete.HasValue) _ = SaveRecordingAsync();
+        return !savingRecording;
     }
     internal void PrepareEmergencyStop()
     {
@@ -380,7 +611,7 @@ public sealed class WholeBodyPage:UserControl
     }
 
     public void ConnectionClosing(){operation?.Cancel();controller.Emergency();}
-    public void ConnectionClosed(){controller.ConnectionClosed();signature=null;goal=null;exiting=false;}
+    public void ConnectionClosed(){controller.ConnectionClosed();signature=null;goal=null;exiting=false;pendingActualTargets=true;}
     public void InvalidateCalibration(){operation?.Cancel();goal=null;hint.Text="零位已变更，请核对标定角度范围";}
     public void CalibrationChanged(){operation?.Cancel();goal=null;signature=null;}
     protected override void Dispose(bool disposing){if(disposing){lifetime.Cancel();timer.Dispose();controller.Dispose();lifetime.Dispose();}base.Dispose(disposing);}

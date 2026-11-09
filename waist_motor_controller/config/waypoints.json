@@ -1,0 +1,58 @@
+[
+  {
+    "id": "06bb0f44-c02d-490a-8e88-eff051c50ef7",
+    "name": "\u6700\u9AD8\u7AD9\u76F4\u70B9",
+    "heightMm": 971.999999994603,
+    "pitchDeg": 0,
+    "yawDeg": 0,
+    "foreAftMm": 65.9999,
+    "axisAnglesDeg": [
+      -0,
+      -0,
+      0,
+      -0
+    ]
+  },
+  {
+    "id": "16e28fea-7d83-44ec-abd5-d38e18366427",
+    "name": "\u4E2D\u5FC3\u6700\u9AD8\u70B9",
+    "heightMm": 969.001117296579,
+    "pitchDeg": 0,
+    "yawDeg": 0,
+    "foreAftMm": 0.8124234705254862,
+    "axisAnglesDeg": [
+      -0,
+      5.2679443359375,
+      0,
+      -5.2679443359375
+    ]
+  },
+  {
+    "id": "ceb02af2-0b95-4271-b53a-e55fb32d52c6",
+    "name": "900\u4E2D\u5FC3\u70B9",
+    "heightMm": 899.998655241908,
+    "pitchDeg": -0.005493164062503761,
+    "yawDeg": 2.01775183297313E-08,
+    "foreAftMm": 0,
+    "axisAnglesDeg": [
+      -0,
+      -17.6385498046875,
+      50.921630859375,
+      -33.28857421875
+    ]
+  },
+  {
+    "id": "aca4eec9-9181-47c6-ba2c-c72ad2a5c800",
+    "name": "\u6700\u4F4E\u6298\u53E0\u70B9",
+    "heightMm": 466.003209365376,
+    "pitchDeg": 0,
+    "yawDeg": 0,
+    "foreAftMm": 180.30835242364464,
+    "axisAnglesDeg": [
+      -0,
+      -88.76953125,
+      142.3663330078125,
+      -53.5968017578125
+    ]
+  }
+]

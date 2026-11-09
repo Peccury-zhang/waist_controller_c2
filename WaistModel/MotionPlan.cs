@@ -7,8 +7,9 @@ public sealed partial class MotionPlan
     readonly double[]? axisDurations;
     public double[] Start=>(double[])start.Clone(); public double[] End=>(double[])end.Clone();
     public string ModelHash {get;} public string CalibrationHash {get;} public double Duration {get;}
+    public double MaxCspAdvanceSeconds { get; }
     MotionPlan(Robot r, Calibration c, double[] start, double[] end, double duration,
-        double[][][] segments, double[]? axisDurations = null, MoveLPath? moveL = null)
+        double[][][] segments, double speedRadPerSecond, double[]? axisDurations = null, MoveLPath? moveL = null)
     {
         this.start = (double[])start.Clone();
         this.end = (double[])end.Clone();
@@ -16,6 +17,8 @@ public sealed partial class MotionPlan
         this.axisDurations = axisDurations;
         this.moveL = moveL;
         Duration = duration;
+        // Leave one encoder count of rounding budget at either end of the step.
+        MaxCspAdvanceSeconds = Math.Min(CspMaxInterval, (CspMaxStepRaw - 2) * EncoderCount / speedRadPerSecond);
         ModelHash = r.Hash;
         CalibrationHash = c.Fingerprint;
     }
@@ -61,7 +64,11 @@ public sealed partial class MotionPlan
     }
 
     public const decimal MinimumOutputLimit = .05m;
-    public const decimal MaximumOutputLimit = 5m;
+    public const decimal MaximumOutputSpeedRpm = 11m;
+    public const decimal MaximumOutputAccelerationRpmPerSec = 62m;
+    public bool IsParkingRecovery { get; private set; }
+    // Output-joint acceleration ramp, shared by MoveL and CSP return-to-zero.
+    public const double AccelerationRampSeconds = .15;
 
     public static MotionPlan CreateIndependent(Robot robot, Calibration calibration, double[] start,
         TaskPose target, double maxSpeedRpm, double maxAccelerationRpmPerSec, CancellationToken cancel = default,
@@ -72,11 +79,41 @@ public sealed partial class MotionPlan
         double maxSpeedRpm, double maxAccelerationRpmPerSec, CancellationToken cancel = default) =>
         CreateIndependentCore(robot, calibration, start, null, maxSpeedRpm, maxAccelerationRpmPerSec, PositionPriority.Both, cancel);
 
+    public static MotionPlan CreateParkingRecovery(Robot robot, Calibration calibration, double[] holding,
+        double[] measured, CancellationToken cancel = default)
+    {
+        ValidateModel(robot);
+        calibration.Check(measured);
+        var limits = calibration.CreateWholeBodyPlanningLimits();
+        limits.CheckPlanningAngles(holding);
+        var end = (double[])holding.Clone();
+        bool needsRecovery = false;
+        const double settleClearance = .15 * Math.PI / 180;
+        for (int axis = 0; axis < end.Length; axis++)
+        {
+            var zone = calibration.WholeBodyZone(axis, measured[axis]);
+            if (zone == WholeBodyLimitZone.Alarm)
+                throw new ArgumentException($"轴 {axis + 1} 已到限位报警线");
+            if (zone == WholeBodyLimitZone.Planning) continue;
+            var (low, high) = limits.Bounds(axis);
+            double target = zone == WholeBodyLimitZone.LowerParking
+                ? Math.Max(holding[axis], low + settleClearance)
+                : Math.Min(holding[axis], high - settleClearance);
+            if (target < low || target > high || Math.Abs(target - holding[axis]) < EncoderCount)
+                throw new ArgumentException($"轴 {axis + 1} 无法从当前保持位置向内退让");
+            end[axis] = target;
+            needsRecovery = true;
+        }
+        if (!needsRecovery) throw new ArgumentException("实测已在普通规划区，无需退让");
+        var plan = BuildIndependent(robot, calibration, holding, end, null, .1, .5, Stopwatch.StartNew(), cancel);
+        plan.IsParkingRecovery = true;
+        return plan;
+    }
+
     private static MotionPlan CreateIndependentCore(Robot robot, Calibration calibration, double[] start,
         TaskPose? target, double maxSpeedRpm, double maxAccelerationRpmPerSec, PositionPriority priority, CancellationToken cancel)
     {
-        if (!ValidOutputLimit(maxSpeedRpm) || !ValidOutputLimit(maxAccelerationRpmPerSec))
-            throw new ArgumentException("最大速度与最大加速度须在 0.05～5 的范围内");
+        ValidateOutputLimits(maxSpeedRpm, maxAccelerationRpmPerSec);
 
         cancel.ThrowIfCancellationRequested();
         var clock = Stopwatch.StartNew();
@@ -88,6 +125,7 @@ public sealed partial class MotionPlan
 
         if (target is not { } request)
         {
+            calibration.CheckWholeBodyStart(start);
             var planningLimits = calibration.CreateWholeBodyPlanningLimits();
             var zero = new double[4];
             // The zero-return curve is monotone on every axis, so its two
@@ -131,28 +169,58 @@ public sealed partial class MotionPlan
         const double rpmToRadPerSecond = 2 * Math.PI / 60;
         double speed = maxSpeedRpm * rpmToRadPerSecond;
         double acceleration = maxAccelerationRpmPerSec * rpmToRadPerSecond;
-        // Let jerk scale with the selected acceleration, while keeping a
-        // bounded acceleration ramp and an absolute CSP ceiling.
-        double maxJerk = Math.Min(1.0, acceleration / .25);
+        // Let jerk scale with the selected acceleration ramp.
+        double maxJerk = acceleration / AccelerationRampSeconds;
         var durations = new double[4];
         for (int i = 0; i < durations.Length; i++)
         {
             double distance = Math.Abs(end[i] - start[i]);
             // Peak normalized derivatives of 10u³ - 15u⁴ + 6u⁵.
-            durations[i] = Math.Max(1.875 * distance / speed,
-                Math.Max(Math.Sqrt((10 / Math.Sqrt(3)) * distance / acceleration),
-                    Math.Cbrt(60 * distance / maxJerk)));
+            double v = 1.875 * distance;
+            double a = (10 / Math.Sqrt(3)) * distance;
+            double accelerationTime = target is null ? StopAccelerationTime(v, a, acceleration) : Math.Sqrt(a / acceleration);
+            double jerkTime = target is null ? StopJerkTime(v, a, 60 * distance, maxJerk) : Math.Cbrt(60 * distance / maxJerk);
+            durations[i] = Math.Max(v / speed, Math.Max(accelerationTime, jerkTime));
         }
 
         double duration = durations.Max();
         if (duration > 60) throw new ArgumentException("轨迹超过 60 秒，请减小动作或检查速度设置");
-        var plan = new MotionPlan(robot, calibration, start, end, duration, [], durations);
+        var plan = new MotionPlan(robot, calibration, start, end, duration, [], speed, durations);
         plan.CertifyIndependentX(calibration, 0, duration, 0, clock, cancel);
         return plan;
     }
 
-    private static bool ValidOutputLimit(double value) =>
-        double.IsFinite(value) && value >= (double)MinimumOutputLimit && value <= (double)MaximumOutputLimit;
+    private static double StopAccelerationTime(double v, double a, double limit)
+    {
+        double term = 1.5 / StopTime * v;
+        return (term + Math.Sqrt(term * term + 4 * limit * a)) / (2 * limit);
+    }
+
+    // Bound the jerk of q(T_stop(t)) for every possible stop start time.
+    // The stop clock has 0 <= w <= 1, |w'| <= 1.5 / StopTime and |w''| <= 6 / StopTime².
+    private static double StopJerkTime(double v, double a, double j, double limit)
+    {
+        double c1 = 6 / (StopTime * StopTime) * v;
+        double c2 = 4.5 / StopTime * a;
+        double lower = Math.Max(c1 / limit, Math.Max(Math.Sqrt(c2 / limit), Math.Cbrt(j / limit)));
+        if (lower == 0) return 0;
+        double upper = 3 * lower;
+        for (int i = 0; i < 24; i++)
+        {
+            double t = (lower + upper) / 2;
+            if ((c1 + (c2 + j / t) / t) / t > limit) lower = t;
+            else upper = t;
+        }
+        return upper;
+    }
+
+    private static void ValidateOutputLimits(double speedRpm, double accelerationRpmPerSec)
+    {
+        if (!double.IsFinite(speedRpm) || speedRpm < (double)MinimumOutputLimit || speedRpm > (double)MaximumOutputSpeedRpm)
+            throw new ArgumentException("最大速度须在 0.05～11 rpm 的范围内");
+        if (!double.IsFinite(accelerationRpmPerSec) || accelerationRpmPerSec < (double)MinimumOutputLimit || accelerationRpmPerSec > (double)MaximumOutputAccelerationRpmPerSec)
+            throw new ArgumentException("最大加速度须在 0.05～62 rpm/s 的范围内");
+    }
 
     private void CertifyIndependentX(Calibration calibration, double from, double to, int depth,
         Stopwatch clock, CancellationToken cancel)
@@ -183,6 +251,7 @@ public sealed partial class MotionPlan
     }
     public static MotionPlan Create(Robot r,Calibration c,double[] start,TaskPose target,CancellationToken cancel=default)
     {
+        const double maxSpeedRadPerSecond = .1;
         ValidateModel(r);c.Validate();c.Check(start);c.CheckX(target.X);var clock=Stopwatch.StartNew();const int n=400;var points=new double[n+1][];points[0]=(double[])start.Clone();var from=DiskKinematics.Forward(start);
         double yawDelta=DiskKinematics.Wrap(target.Yaw-from.Yaw);int branch=Math.Sign(start[2]);
         for(int k=1;k<=n;k++)
@@ -241,7 +310,7 @@ public sealed partial class MotionPlan
                     prevV = velocity;
                     prevA = acceleration;
                 }
-                duration=Math.Max(duration,Math.Max(vmax*n/.1,Math.Max(Math.Sqrt(amax*n*n/.1),Math.Cbrt(jmax*n*n*n/.2))));
+                duration=Math.Max(duration,Math.Max(vmax*n/maxSpeedRadPerSecond,Math.Max(Math.Sqrt(amax*n*n/.1),Math.Cbrt(jmax*n*n*n/.2))));
             }
             Certify(c, coeff[k], 0, clock, cancel);
             // Independent interpolation residual checks, including raw quantization at sample targets.
@@ -249,7 +318,7 @@ public sealed partial class MotionPlan
         }
         if(duration>60||!double.IsFinite(duration))throw new ArgumentException("轨迹接近奇异点或耗时超过60秒，请缩小动作");
         cancel.ThrowIfCancellationRequested();if(clock.Elapsed.TotalSeconds>1)throw new TimeoutException("整路验证超过1秒");
-        return new(r, c, points[0], points[^1], duration, coeff);
+        return new(r, c, points[0], points[^1], duration, coeff, maxSpeedRadPerSecond);
     }
     static void ValidateModel(Robot r)
     {

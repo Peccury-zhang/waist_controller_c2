@@ -41,6 +41,9 @@ internal static class Program
             if (args.Contains("--frame-smoke")) { FrameSmoke(); return 0; }
             if (args.Contains("--render")) { Render(args); return 0; }
             WholeBodyTests.Run();
+            var previousContext = SynchronizationContext.Current;
+            WholeBodyPageTests.Run();
+            SynchronizationContext.SetSynchronizationContext(previousContext);
             Run().GetAwaiter().GetResult();
             Console.WriteLine($"PASS: {count} assertions; no hardware opened.");
             return 0;
@@ -426,15 +429,22 @@ internal static class Program
         const BindingFlags flags = BindingFlags.Instance | BindingFlags.NonPublic;
         var selection = (ComboBox)typeof(MainForm).GetField("_motorCombo", flags)!.GetValue(form)!;
         var cards = (Array)typeof(MainForm).GetField("_motorCards", flags)!.GetValue(form)!;
+        var angles = (Label[])typeof(MainForm).GetField("_motorCardAngles", flags)!.GetValue(form)!;
+        var angleText = typeof(MainForm).GetMethod("JointAngleText", BindingFlags.Static | BindingFlags.NonPublic)!;
+        var feedback = new MotorFeedback { PositionRaw = 16384 };
+        Assert(angles.All(angle => angle.Text == "—") &&
+            Equals(angleText.Invoke(null, [feedback, -1]), $"{-90d:F2}°") &&
+            Equals(angleText.Invoke(null, [feedback, 1]), $"{90d:F2}°"), "motor cards show signed feedback in degrees, or a dash when offline");
         var onClick = typeof(System.Windows.Forms.Control).GetMethod("OnClick", flags)!;
         for (int i = 0; i < cards.Length; i++)
         {
             var card = (System.Windows.Forms.Control)cards.GetValue(i)!;
             var row = card.Controls.OfType<FlowLayoutPanel>().Single();
+            var header = card.Controls.OfType<TableLayoutPanel>().Single();
             var idInput = row.Controls.OfType<NumericUpDown>().Single();
             decimal originalId = idInput.Value;
             // Test each separately: row blank space used to swallow clicks beside the online label.
-            var areas = new[] { card, row }.Concat(card.Controls.OfType<Label>()).Concat(row.Controls.OfType<Label>());
+            var areas = new[] { card, row, header }.Concat(header.Controls.OfType<Label>()).Concat(row.Controls.OfType<Label>());
             foreach (var area in areas)
             {
                 selection.SelectedIndex = (i + 1) % cards.Length;

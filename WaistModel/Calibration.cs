@@ -3,6 +3,7 @@ using System.Text.Json.Serialization;
 using System.Security.Cryptography;
 namespace WaistModel;
 public sealed record MotorLimit(int LogicalId,double MinAngleDeg,double MaxAngleDeg);
+public enum WholeBodyLimitZone { Planning, LowerParking, UpperParking, Alarm }
 public sealed class TaskLimits
 {
     public string ReferenceFrame {get;set;}="base_link";
@@ -13,7 +14,9 @@ public sealed class TaskLimits
 }
 public sealed class Calibration
 {
-    public const double WholeBodyPlanningMarginDeg = .3;
+    public const double WholeBodyPlanningMarginDeg = .4;
+    public const double WholeBodyAlarmMarginDeg = .2;
+    private const double CountsPerDegree = 65536.0 / 360;
 
     public int SchemaVersion {get;set;}=2;
     public string AngleUnit {get;set;}="deg";
@@ -52,30 +55,70 @@ public sealed class Calibration
     internal Calibration CreateWholeBodyPlanningLimits()
     {
         Validate();
-        // The executor rounds on the original grid. Reserve an extra half
-        // count so rounding in either direction still leaves a 0.3° gap.
-        const double inset = WholeBodyPlanningMarginDeg + 180.0 / 65536 + 1e-9;
+        // Snap inwards to the encoder grid. These same encoded boundary
+        // values can be used as measured starts of a later plan.
         var motors = Motors.Select(motor => new MotorLimit(motor.LogicalId,
-            motor.MinAngleDeg + inset, motor.MaxAngleDeg - inset)).ToArray();
+            Math.Ceiling((motor.MinAngleDeg + WholeBodyPlanningMarginDeg) * CountsPerDegree) / CountsPerDegree,
+            Math.Floor((motor.MaxAngleDeg - WholeBodyPlanningMarginDeg) * CountsPerDegree) / CountsPerDegree)).ToArray();
         var unusable = motors.FirstOrDefault(motor => motor.MinAngleDeg >= motor.MaxAngleDeg);
         if (unusable is not null)
-            throw new ArgumentException($"轴{unusable.LogicalId}标定区间不足以在两侧各预留 0.3°");
+            throw new ArgumentException($"轴{unusable.LogicalId}标定区间不足以在两侧各预留 0.4°");
         return new Calibration { Motors = motors, Signs = (int[])Signs.Clone(), TaskLimits = TaskLimits };
+    }
+
+    public (double Low, double High) WholeBodyAlarmBounds(int axis)
+    {
+        var (low, high) = Bounds(axis);
+        const double margin = WholeBodyAlarmMarginDeg * Math.PI / 180;
+        return (low + margin, high - margin);
+    }
+
+    public WholeBodyLimitZone WholeBodyZone(int axis, double joint) =>
+        ClassifyWholeBodyZone(axis, joint, WholeBodyPlanningMarginDeg);
+
+    // Feedback can toggle between adjacent encoder counts while a legal target is held.
+    // Only the parking interlock gets one count of tolerance. The alarm remains exact.
+    public WholeBodyLimitZone WholeBodyStationaryFeedbackZone(int axis, double joint) =>
+        ClassifyWholeBodyZone(axis, joint, WholeBodyPlanningMarginDeg - 1 / CountsPerDegree);
+
+    private WholeBodyLimitZone ClassifyWholeBodyZone(int axis, double joint, double planningMarginDeg)
+    {
+        var (low, high) = Bounds(axis);
+        const double alarm = WholeBodyAlarmMarginDeg * Math.PI / 180;
+        double planning = planningMarginDeg * Math.PI / 180;
+        if (!double.IsFinite(joint) || joint <= low + alarm + 1e-12 || joint >= high - alarm - 1e-12)
+            return WholeBodyLimitZone.Alarm;
+        if (joint < low + planning - 1e-12) return WholeBodyLimitZone.LowerParking;
+        if (joint > high - planning + 1e-12) return WholeBodyLimitZone.UpperParking;
+        return WholeBodyLimitZone.Planning;
+    }
+
+    public void CheckWholeBodyStart(double[] joints)
+    {
+        Check(joints);
+        for (int axis = 0; axis < joints.Length; axis++)
+        {
+            var zone = WholeBodyZone(axis, joints[axis]);
+            if (zone == WholeBodyLimitZone.Alarm)
+                throw new ArgumentException($"轴 {axis + 1} 已到限位报警线");
+            if (zone != WholeBodyLimitZone.Planning)
+                throw new ArgumentException($"轴 {axis + 1} 位于停车区，请先向内退让");
+        }
     }
 
     public void Check(double[] q,bool task=true)
         => CheckRange(q, task, "标定");
 
     internal void CheckPlanningAngles(double[] q)
-        => CheckRange(q, false, "规划范围（两侧各留 0.3°）");
+        => CheckRange(q, false, "规划范围（两侧各留 0.4°）", tolerance: 1e-12);
 
-    private void CheckRange(double[] q, bool task, string rangeName)
+    private void CheckRange(double[] q, bool task, string rangeName, double tolerance = 0)
     {
         if(q.Length!=4)throw new ArgumentException("需要四轴");
         for (int i = 0; i < 4; i++)
         {
             var bounds = Bounds(i);
-            if (double.IsFinite(q[i]) && q[i] >= bounds.Low && q[i] <= bounds.High) continue;
+            if (double.IsFinite(q[i]) && q[i] >= bounds.Low - tolerance && q[i] <= bounds.High + tolerance) continue;
             var motor = Motors.Single(m => m.LogicalId == i + 1);
             double displayDeg = DisplayToUrdfSign(i) * q[i] * 180 / Math.PI;
             throw new ArgumentException($"轴{i + 1}关节角 {displayDeg:F4}°，超出{rangeName} [{motor.MinAngleDeg:0.####}, {motor.MaxAngleDeg:0.####}]°");

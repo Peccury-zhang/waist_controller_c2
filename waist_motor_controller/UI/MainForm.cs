@@ -209,7 +209,7 @@ public sealed partial class MainForm : Form
         }
         else
         {
-            if (_wholeBodyPage?.PrepareClose() == false) { ShowNotice("全身运控正在停止，请稍后再关闭设备"); return; }
+            if (_wholeBodyPage?.PrepareClose() == false) { ShowNotice("全身运控正在停止或保存录制，请稍后再关闭设备"); return; }
             CloseDeviceSafely();
         }
         UpdateConnectionUi();
@@ -398,20 +398,32 @@ public sealed partial class MainForm : Form
         RefreshStatus();
     }
 
-    // ================= 状态刷新（50ms 拉取缓存） =================
+    // ================= 状态刷新（100ms 拉取缓存） =================
+
+    private static string JointAngleText(MotorFeedback? feedback, int direction) =>
+        feedback is null ? "—" : $"{(feedback.PositionRaw == 0 ? 0 : direction * feedback.PositionDeg):F2}°";
 
     private void RefreshStatus()
     {
         bool open = _transport.IsOpen;
         long now = Environment.TickCount64;
         var alive = new List<string>();
+        int selectedIndex = CurrentLogicalIndex;
+        var motor = _registry.Motors[selectedIndex];
+        int idSelected = motor.DeviceId;
+        MotorFeedback? fb = null;
         for (int i = 0; i < 4; i++)
         {
-            int id = _registry.Motors[i].DeviceId;
+            var mappedMotor = _registry.Motors[i];
+            int id = mappedMotor.DeviceId;
             bool online = open && _transport.IsDeviceAlive(id);
+            var feedback = online ? _transport.GetFeedback(id) : null;
+            if (i == selectedIndex) fb = feedback;
             if (online) alive.Add(id.ToString());
             UiValueCache.Text(_onlineLabels[i], online ? "● 在线" : "● 离线");
             UiValueCache.Color(_onlineLabels[i], online ? OkColor : TextSub);
+            UiValueCache.Text(_motorCardAngles[i], JointAngleText(feedback, mappedMotor.Direction));
+            UiValueCache.Color(_motorCardAngles[i], feedback is null ? TextSub : UiTheme.ValueBlue);
         }
         UiValueCache.Text(_busIdLabel, open ? alive.Count == 0 ? "无" : string.Join(", ", alive) : "--");
         if (!open || now - _lastCountersUiTick >= 500)
@@ -420,9 +432,6 @@ public sealed partial class MainForm : Form
             UiValueCache.Text(_rxTxLabel, open ? $"{_transport.RxFrameCount:N0} / {_transport.TxFrameCount:N0}" : "--");
             _uiValues.Tip(_tips, _rxTxLabel, $"有效反馈：{_transport.FeedbackCount:N0} 帧；异常反馈长度：{_transport.BadFeedbackCount:N0} 帧");
         }
-        int idSelected = CurrentDeviceId;
-        var fb = open && _transport.IsDeviceAlive(idSelected) ? _transport.GetFeedback(idSelected) : null;
-        var motor = _registry.Motors[CurrentLogicalIndex];
         if (fb == null)
         {
             foreach (var label in new[] { _posLabel, _velLabel, _modeLabel, _curLabel, _faultLabel, _tempLabel }) UiValueCache.Text(label, "—");
@@ -433,8 +442,7 @@ public sealed partial class MainForm : Form
         }
         else
         {
-            double jointDeg = fb.PositionRaw == 0 ? 0 : motor.Direction * fb.PositionDeg;
-            UiValueCache.Text(_posLabel, $"{jointDeg:F2}°");
+            UiValueCache.Text(_posLabel, JointAngleText(fb, motor.Direction));
             _uiValues.Tip(_tips, _posLabel, $"电机角：{fb.PositionDeg:F2}°（{fb.PositionRaw} cnt）");
             UiValueCache.Text(_velLabel, $"{fb.VelocityRpm} RPM");
             UiValueCache.Text(_modeLabel, fb.ModeName);

@@ -12,6 +12,8 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- The designer can generate a duplicate resource for the MainForm partial class. -->
+    <EmbeddedResource Remove="UI\MainForm.Layout.resx" />
     <EmbeddedResource Include="assets\yclab.ico" LogicalName="waist_motor_controller.yclab.ico" />
     <EmbeddedResource Include="assets\yclab2_orange.png" LogicalName="waist_motor_controller.yclab2_orange.png" />
     <None Update="native\ControlCANFD.dll">

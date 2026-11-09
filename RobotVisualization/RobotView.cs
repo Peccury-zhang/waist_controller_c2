@@ -15,6 +15,7 @@ public sealed class RobotView : System.Windows.Forms.UserControl
 {
     readonly System.Windows.Forms.Integration.ElementHost host = new() { Dock=System.Windows.Forms.DockStyle.Fill };
     readonly Viewport3D viewport = new();
+    readonly TextBlock jointFeedback = new() { FontFamily = new FontFamily("Consolas"), FontSize = 14, Foreground = Brushes.White };
     readonly PerspectiveCamera camera = new() { FieldOfView=40, UpDirection=new(0,0,1), NearPlaneDistance=0.01, FarPlaneDistance=100 };
     readonly List<(Visual Visual,GeometryModel3D Actual,GeometryModel3D Target)> parts = new();
     readonly Robot robot;
@@ -37,6 +38,29 @@ public sealed class RobotView : System.Windows.Forms.UserControl
         if (readCurrentPose is not null)
             cameraTools.Children.Add(CameraButton("当前位姿", readCurrentPose));
         sceneLayout.Children.Add(cameraTools);
+        var feedbackContent = new StackPanel();
+        feedbackContent.Children.Add(new TextBlock
+        {
+            Text = "实时关节角",
+            FontSize = 12,
+            Foreground = Brushes.LightSteelBlue,
+            Margin = new System.Windows.Thickness(0, 0, 0, 5),
+        });
+        feedbackContent.Children.Add(jointFeedback);
+        sceneLayout.Children.Add(new Border
+        {
+            Child = feedbackContent,
+            HorizontalAlignment = System.Windows.HorizontalAlignment.Right,
+            VerticalAlignment = System.Windows.VerticalAlignment.Top,
+            Margin = new System.Windows.Thickness(0, 44, 8, 0),
+            Padding = new System.Windows.Thickness(9, 7, 9, 7),
+            Background = new SolidColorBrush(Color.FromArgb(224, 20, 28, 40)),
+            BorderBrush = new SolidColorBrush(Color.FromRgb(62, 78, 99)),
+            BorderThickness = new System.Windows.Thickness(1),
+            CornerRadius = new System.Windows.CornerRadius(5),
+            IsHitTestVisible = false,
+        });
+        UpdateJointFeedback(null);
         host.Child = sceneLayout;
         viewport.Camera=camera;
         var scene=new Model3DGroup(); scene.Children.Add(new AmbientLight(Color.FromRgb(130,130,130))); scene.Children.Add(new DirectionalLight(Colors.White,new(-1,1,-2)));
@@ -96,6 +120,13 @@ public sealed class RobotView : System.Windows.Forms.UserControl
         bitmap.Render(element);var encoder=new System.Windows.Media.Imaging.PngBitmapEncoder();encoder.Frames.Add(System.Windows.Media.Imaging.BitmapFrame.Create(bitmap));using var output=File.Create(path);encoder.Save(output);
     }
     public void ResetView(bool side=false) { azimuth=side ? -Math.PI/2 : -1.1; elevation=0.3; distance=3.2; UpdateCamera(); }
+    public void UpdateJointFeedback(double[]? anglesDeg)
+    {
+        string text = string.Join(Environment.NewLine, Enumerable.Range(0, 4).Select(i =>
+            anglesDeg is null ? $"M{i + 1}      —" : $"M{i + 1} {anglesDeg[i],7:F2}°"));
+        if (jointFeedback.Text != text) jointFeedback.Text = text;
+    }
+
     void UpdateCamera() { var p=new Point3D(distance*Math.Cos(elevation)*Math.Cos(azimuth),distance*Math.Cos(elevation)*Math.Sin(azimuth),0.65+distance*Math.Sin(elevation)); camera.Position=p; camera.LookDirection=new Point3D(0,0,0.65)-p; }
     static Material Material(float r,float g,float b,float a) { var m=new DiffuseMaterial(new SolidColorBrush(Color.FromScRgb(a,r,g,b))); m.Freeze(); return m; }
     public void UpdatePose(double[] actual,double[]? target,bool stale)

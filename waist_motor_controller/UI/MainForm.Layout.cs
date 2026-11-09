@@ -12,6 +12,7 @@ public sealed partial class MainForm
     private enum BtnKind { Normal, Primary, Success, Warning, Danger, SoftDanger, SoftOrange }
     private readonly SurfacePanel[] _motorCards = new SurfacePanel[4];
     private readonly Label[] _motorCardTitles = new Label[4];
+    private readonly Label[] _motorCardAngles = new Label[4];
     private static readonly string[] JointDisplayNames = { "上部旋转", "折叠腿高", "折叠腿中", "折叠腿低" };
     private readonly ToolTip _tips = new() { ShowAlways = true, InitialDelay = 350, ReshowDelay = 100 };
     private Label _motionHint = null!;
@@ -331,10 +332,21 @@ public sealed partial class MainForm
             var tile = new SurfacePanel { Dock = DockStyle.Fill, Margin = new Padding(0, 0, 0, 10),
                 Padding = new Padding(13, 10, 13, 10), Cursor = Cursors.Hand };
             _motorCards[i] = tile;
+            var header = Grid(2, 1);
+            header.Dock = DockStyle.Top;
+            header.Height = 31;
+            header.BackColor = Color.Transparent;
+            header.ColumnStyles[1].SizeType = SizeType.Absolute;
+            header.ColumnStyles[1].Width = 70;
             var name = new Label { Text = MotorDisplayName(i), ForeColor = TextMain,
-                Font = UiTheme.Font(11.5F, FontStyle.Bold), Dock = DockStyle.Top, Height = 31,
-                BackColor = Color.Transparent, AutoEllipsis = true };
+                Font = UiTheme.Font(11.5F, FontStyle.Bold), Dock = DockStyle.Fill, Margin = Padding.Empty,
+                BackColor = Color.Transparent, AutoEllipsis = true, TextAlign = ContentAlignment.MiddleLeft };
             _motorCardTitles[i] = name;
+            var angle = new Label { Text = "—", ForeColor = TextSub, Font = UiTheme.Font(10.5F, FontStyle.Bold),
+                BackColor = Color.Transparent, Dock = DockStyle.Fill, Margin = Padding.Empty, TextAlign = ContentAlignment.MiddleRight };
+            _motorCardAngles[i] = angle;
+            header.Controls.Add(name, 0, 0);
+            header.Controls.Add(angle, 1, 0);
             var bottom = new BufferedFlowLayoutPanel { Dock = DockStyle.Bottom, Height = 31, WrapContents = false, Margin = Padding.Empty, BackColor = Color.Transparent };
             var id = Caption("ID"); id.Anchor = AnchorStyles.Left; id.Margin = new Padding(0, 0, 8, 0);
             _idNums[i] = NewNum(1, 127, motor.DeviceId, 58);
@@ -343,9 +355,11 @@ public sealed partial class MainForm
             _onlineLabels[i].Anchor = AnchorStyles.Left;
             _onlineLabels[i].Margin = new Padding(18, 0, 0, 0);
             bottom.Controls.AddRange(new System.Windows.Forms.Control[] { id, _idNums[i], _onlineLabels[i] });
-            tile.Controls.Add(bottom); tile.Controls.Add(name);
+            tile.Controls.Add(bottom); tile.Controls.Add(header);
             tile.Click += (_, _) => _motorCombo.SelectedIndex = index;
+            header.Click += (_, _) => _motorCombo.SelectedIndex = index;
             name.Click += (_, _) => _motorCombo.SelectedIndex = index;
+            angle.Click += (_, _) => _motorCombo.SelectedIndex = index;
             // Child controls do not bubble Click to the card, including blank space in this row.
             bottom.Click += (_, _) => _motorCombo.SelectedIndex = index;
             id.Click += (_, _) => _motorCombo.SelectedIndex = index;

@@ -24,6 +24,7 @@ public sealed partial class MotionPlan
 
     public TaskPose? ExpectedMoveLPose(double elapsed) => moveL?.Pose(Math.Clamp(elapsed / Duration, 0, 1));
     public string? MoveLLimitingConstraint => moveL?.LimitingConstraint;
+    public double MoveLPlannedPeakRpm { get; private set; }
 
     public (double CrossTrackMm, double AlongErrorMm, double AngleErrorDeg)? MoveLDeviation(double elapsed, TaskPose actual)
     {
@@ -56,7 +57,7 @@ public sealed partial class MotionPlan
 
     public static double SuggestCenteredX(Calibration calibration, double[] start, TaskPose request)
     {
-        calibration.Check(start);
+        calibration.CheckWholeBodyStart(start);
         var limits = calibration.CreateWholeBodyPlanningLimits();
         limits.CheckPlanningAngles(start);
         RequirePositiveFoldStart(start);
@@ -68,12 +69,35 @@ public sealed partial class MotionPlan
         throw new ArgumentException("此高度和姿态在正折叠分支上没有可用前后值");
     }
 
+    public static (TaskPose Pose, short[] TargetRaw) ResolveCenteredEndpoint(Calibration calibration, TaskPose request)
+    {
+        if (!double.IsFinite(request.Pitch) || !double.IsFinite(request.Yaw))
+            throw new ArgumentException("俯仰和航向必须为有限数值");
+        var limits = calibration.CreateWholeBodyPlanningLimits();
+        MoveLWorkspace.FromPlanningLimits(limits).CheckHeight(request.Z);
+        var seed = new double[4];
+        foreach (var pose in CenteredHeightTargets(limits, request))
+        {
+            var joints = DiskKinematics.FindAnalytic(limits, pose, seed, PositiveFold, out _);
+            if (joints is null) continue;
+            try
+            {
+                var raw = calibration.Encode(null, joints);
+                var encoded = raw.Select((value, i) => calibration.ToJoint(i, value)).ToArray();
+                limits.CheckPlanningAngles(encoded);
+                if (DiskKinematics.Matches(pose, encoded))
+                    return (pose, raw);
+            }
+            catch (ArgumentException) { } // A candidate at the workspace boundary may fail after quantization.
+        }
+        throw new ArgumentException("此高度和姿态在当前标定范围内没有可用点位");
+    }
+
     public static MotionPlan CreateMoveL(Robot robot, Calibration calibration, double[] start, TaskPose request,
         double maxSpeedRpm, double maxAccelerationRpmPerSec, CancellationToken cancel = default,
         PositionPriority priority = PositionPriority.Both)
     {
-        if (!ValidOutputLimit(maxSpeedRpm) || !ValidOutputLimit(maxAccelerationRpmPerSec))
-            throw new ArgumentException("最大速度与最大加速度须在 0.05～5 的范围内");
+        ValidateOutputLimits(maxSpeedRpm, maxAccelerationRpmPerSec);
         if (!double.IsFinite(request.X) || !double.IsFinite(request.Z) ||
             !double.IsFinite(request.Pitch) || !double.IsFinite(request.Yaw))
             throw new ArgumentException("目标必须为有限数值");
@@ -81,7 +105,7 @@ public sealed partial class MotionPlan
         ValidateModel(robot);
         var planningLimits = calibration.CreateWholeBodyPlanningLimits();
         var workspace = MoveLWorkspace.FromPlanningLimits(planningLimits);
-        calibration.Check(start);
+        calibration.CheckWholeBodyStart(start);
         planningLimits.CheckPlanningAngles(start);
         RequirePositiveFoldStart(start);
         var from = DiskKinematics.Forward(start);
@@ -121,18 +145,16 @@ public sealed partial class MotionPlan
             }
             if (priority == PositionPriority.Both) break;
         }
-        throw new ArgumentException(failure ?? "未找到满足正折叠分支及 0.3° 内侧余量的 MoveL 目标");
+        throw new ArgumentException(failure ?? "未找到满足正折叠分支及 0.4° 内侧余量的 MoveL 目标");
     }
 
     private static MotionPlan BuildMoveL(Robot robot, Calibration calibration, Calibration planningLimits, double[] start, MoveLPath path,
         double speedRpm, double accelerationRpm, Stopwatch clock, CancellationToken cancel)
     {
         const double rpmToRad = 2 * Math.PI / 60;
-        // Allow for one encoder count of error at either end of a late cycle.
-        double stepSpeed = (CspMaxStepRaw - 2) * EncoderCount / CspMaxInterval;
-        double speed = Math.Min(speedRpm * rpmToRad, stepSpeed);
+        double speed = speedRpm * rpmToRad;
         double acceleration = accelerationRpm * rpmToRad;
-        double jerk = Math.Min(1, acceleration / .25);
+        double jerk = acceleration / AccelerationRampSeconds;
         var limits = Enumerable.Range(0, 4).Select(planningLimits.Bounds).ToArray();
         var encoderLimits = Enumerable.Range(0, 4).Select(i =>
         {
@@ -201,15 +223,15 @@ public sealed partial class MotionPlan
                     double vNorm = d1 * n, aNorm = d2 * n * n;
                     // Reserve acceleration for the same-path stop clock.
                     // |q̈_stop| <= aNorm/T² + (1.5/StopTime) * vNorm/T.
-                    double stopTerm = 1.5 * vNorm / StopTime;
-                    double accelTime = (stopTerm + Math.Sqrt(stopTerm * stopTerm + 4 * acceleration * aNorm)) / (2 * acceleration);
-                    double speedTime = vNorm / speed, jerkTime = n * Math.Cbrt(d3 / jerk);
+                    double accelTime = StopAccelerationTime(vNorm, aNorm, acceleration);
+                    double speedTime = vNorm / speed;
+                    double jerkTime = StopJerkTime(vNorm, aNorm, d3 * n * n * n, jerk);
                     double requiredTime = Math.Max(speedTime, Math.Max(accelTime, jerkTime));
                     if (requiredTime > duration)
                     {
                         duration = requiredTime;
-                        string limit = requiredTime == speedTime ? (speed == stepSpeed ? "CSP 步长" : "速度") :
-                            requiredTime == accelTime ? "加速度和制动余量" : "加加速度";
+                        string limit = requiredTime == speedTime ? "速度" :
+                            requiredTime == accelTime ? "加速度和制动余量" : "加加速度和制动余量";
                         limitingConstraint = $"轴 {axis + 1} {limit}限速";
                     }
                 }
@@ -223,7 +245,7 @@ public sealed partial class MotionPlan
             if (!certified) continue;
             if (!double.IsFinite(duration) || duration > 60)
                 throw new ArgumentException("MoveL 超过 60 秒，请减小动作或检查速度设置");
-            var plan = new MotionPlan(robot, calibration, start, points[^1], duration, curves,
+            var plan = new MotionPlan(robot, calibration, start, points[^1], duration, curves, speed,
                 moveL: path with { LimitingConstraint = limitingConstraint });
             VerifyCspSamples(robot, calibration, plan, path, clock, cancel);
             return plan;
@@ -324,12 +346,16 @@ public sealed partial class MotionPlan
         Stopwatch clock, CancellationToken cancel)
     {
         short[]? previous = null;
+        double[]? previousJoints = null;
+        double previousTime = 0;
+        double peakRpm = 0;
         int samples = (int)Math.Ceiling(plan.Duration / .005);
         for (int k = 0; k <= samples; k++)
         {
             if ((k & 63) == 0) CheckBudget(clock, cancel);
             double t = Math.Min(plan.Duration, k * .005);
-            var raw = calibration.Encode(robot, plan.At(t));
+            var plannedJoints = plan.At(t);
+            var raw = calibration.Encode(robot, plannedJoints);
             var joints = raw.Select((value, i) => calibration.ToJoint(i, value)).ToArray();
             var disk = robot.Forward(joints)["bady_link_4"];
             var actual = DiskKinematics.Forward(joints);
@@ -342,9 +368,17 @@ public sealed partial class MotionPlan
                 throw new ArgumentException("MoveL 量化后的指令位姿误差超限");
             if (previous is not null && raw.Zip(previous, (a, b) => Math.Abs(a - b)).Any(step => step > CspMaxStepRaw))
                 throw new ArgumentException("MoveL 相邻 CSP 目标步长超限");
+            if (previousJoints is not null && t > previousTime)
+            {
+                for (int axis = 0; axis < plannedJoints.Length; axis++)
+                    peakRpm = Math.Max(peakRpm, Math.Abs(plannedJoints[axis] - previousJoints[axis]) / (t - previousTime) * 30 / Math.PI);
+            }
             previous = raw;
+            previousJoints = plannedJoints;
+            previousTime = t;
         }
         CheckBudget(clock, cancel);
+        plan.MoveLPlannedPeakRpm = peakRpm;
     }
 
     private static void CheckBudget(Stopwatch clock, CancellationToken cancel)
