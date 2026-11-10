@@ -1,4 +1,5 @@
 using System.Windows.Forms;
+using waist_motor_controller.Control;
 using waist_motor_controller.Protocol;
 
 namespace waist_motor_controller.UI;
@@ -10,14 +11,15 @@ public sealed partial class MainForm
         PrimaryColor = UiTheme.Blue, DangerColor = UiTheme.Red, OkColor = UiTheme.Green,
         TextMain = UiTheme.Text, TextSub = UiTheme.Muted;
     private enum BtnKind { Normal, Primary, Success, Warning, Danger, SoftDanger, SoftOrange }
-    private readonly SurfacePanel[] _motorCards = new SurfacePanel[4];
-    private readonly Label[] _motorCardTitles = new Label[4];
-    private readonly Label[] _motorCardAngles = new Label[4];
-    private static readonly string[] JointDisplayNames = { "上部旋转", "折叠腿高", "折叠腿中", "折叠腿低" };
+    private const int JointPageHeight = 744 + (AppConfig.MotorCount - AppConfig.WaistAxisCount) * 93;
+    private readonly SurfacePanel[] _motorCards = new SurfacePanel[AppConfig.MotorCount];
+    private readonly Label[] _motorCardTitles = new Label[AppConfig.MotorCount];
+    private readonly Label[] _motorCardAngles = new Label[AppConfig.MotorCount];
+    private static readonly string[] JointDisplayNames = { "上部旋转", "折叠腿高", "折叠腿中", "折叠腿低", "头部点头", "头部摇头" };
+    private static readonly int[] MotorDisplayOrder = [4, 5, 0, 1, 2, 3];
     private readonly ToolTip _tips = new() { ShowAlways = true, InitialDelay = 350, ReshowDelay = 100 };
     private Label _motionHint = null!;
     private Button _saveMappingButton = null!;
-    private Button _returnAllZeroButton = null!;
     private Button _enableAllButton = null!;
     private readonly Panel[] _pages = new Panel[4];
     private readonly Button[] _pageButtons = new Button[4];
@@ -42,19 +44,9 @@ public sealed partial class MainForm
             Margin = Padding.Empty,
         };
 
-    private Button CreateReturnAllZeroButton()
-    {
-        var button = NewButton("全部回零位", kind: BtnKind.Primary);
-        button.Dock = DockStyle.Fill;
-        button.Click += (_, _) => RunMotorOp("全部回零位",
-            () => _controller.ReturnAllToZero(JogAccel, PpProfileSpeed));
-        _tips.SetToolTip(button, "仅让已通过本程序使能的映射关节回到 0°，未使能关节自动跳过。使用关节控制页的轨迹速度和加速度。");
-        return button;
-    }
-
     private ActionButton CreateEmergencyStopButton()
     {
-        var button = (ActionButton)NewButton("■  急停 · 4 台电机", kind: BtnKind.Danger);
+        var button = (ActionButton)NewButton("■  急停 · 6 台电机", kind: BtnKind.Danger);
         button.Dock = DockStyle.Fill;
         button.Click += (_, _) =>
         {
@@ -148,9 +140,9 @@ public sealed partial class MainForm
         _motorCombo = new JointComboBox { DropDownStyle = ComboBoxStyle.DropDownList, FlatStyle = FlatStyle.Flat,
             Font = UiTheme.Font(11.5F, FontStyle.Bold), BackColor = TileColor, ForeColor = TextMain,
             Dock = DockStyle.Fill, Margin = new Padding(0, 3, 0, 0) };
-        for (int i = 0; i < _registry.Motors.Count; i++) _motorCombo.Items.Add(MotorDisplayName(i));
+        foreach (int i in MotorDisplayOrder) _motorCombo.Items.Add(MotorDisplayName(i));
         _motorCombo.DrawMode = DrawMode.OwnerDrawFixed;
-        _motorCombo.SelectedIndex = 0;
+        _motorCombo.SelectedIndex = Array.IndexOf(MotorDisplayOrder, 0);
 
         var root = Grid(1, 2);
         root.BackColor = BgColor; root.Padding = new Padding(20, 18, 20, 18);
@@ -189,7 +181,7 @@ public sealed partial class MainForm
         workspace.Controls.Add(motors, 0, 0);
         var control = BuildMotorSection(); control.Margin = Padding.Empty;
         workspace.Controls.Add(control, 1, 0);
-        _pages[1] = CreatePage(workspace, 816);
+        _pages[1] = CreatePage(workspace, JointPageHeight);
         try
         {
             _wholeBodyPage = new waist_motor_controller.WholeBody.WholeBodyPage(_transport, _registry, _controller,
@@ -202,17 +194,22 @@ public sealed partial class MainForm
             _pages[2] = new Panel { Dock = DockStyle.Fill };
             _pages[2].Controls.Add(new Label { Dock = DockStyle.Fill, Text = "Whole body model unavailable: " + ex.Message, ForeColor = TextMain });
         }
-        var calibrationPage = new waist_motor_controller.WholeBody.CalibrationPage(new WaistModel.CalibrationStore(),
-            () => _wholeBodyPage?.Busy == true || _registry.Motors.Any(m => _controller.IsJogging(m.DeviceId) || _controller.IsBusy(m.DeviceId)),
-            () => _registry.Motors.Select(m => m.Direction).ToArray());
-        calibrationPage.Saved += () => _wholeBodyPage?.CalibrationChanged();
-        _pages[3] = new BufferedPanel { Dock = DockStyle.Fill, AutoScroll = true }; _pages[3].Controls.Add(calibrationPage);
+        var calibrationPage = new waist_motor_controller.WholeBody.CalibrationPage(_calibrationStore, _registry,
+            () => _wholeBodyPage?.Busy == true || _registry.Motors.Any(m => _controller.IsJogging(m.DeviceId) || _controller.IsBusy(m.DeviceId)));
+        calibrationPage.Saved += () =>
+        {
+            _controller.ReloadJointLimits();
+            _wholeBodyPage?.CalibrationChanged();
+        };
+        _pages[3] = new BufferedPanel { Dock = DockStyle.Fill }; _pages[3].Controls.Add(calibrationPage);
         foreach (var page in _pages) { page.Visible = false; host.Controls.Add(page); }
         _pageTransition = new PageTransition(); host.Controls.Add(_pageTransition);
         Controls.Add(root);
         SelectPage(0);
         _motorCombo.SelectedIndexChanged += (_, _) =>
         {
+            if (_motorCombo.SelectedIndex < 0) return;
+            ShowSelectedJointProfile();
             UpdateMotorSelection();
             UpdateDirectionUi();
             if (_uiTimer != null) RefreshStatus();
@@ -250,6 +247,11 @@ public sealed partial class MainForm
         }
         _pages[index].BringToFront();
         _selectedPage = index;
+        if (index == 1)
+        {
+            _controller.ReloadJointLimits();
+            RefreshStatus();
+        }
         ResumeLayout(true);
         _pageTransition.Start(before);
     }
@@ -283,11 +285,15 @@ public sealed partial class MainForm
         _rxTxLabel = traffic.ValueLabel; _rxTxLabel.Font = UiTheme.Font(11.5F, FontStyle.Bold);
         var speed = new Tile("通信速率", "1M / 5M · CANFD");
         speed.ValueLabel.Font = UiTheme.Font(10.5F, FontStyle.Bold);
-        var adapter = new Tile("适配器信息", "USBCANFD-200U  ·  标准帧 · BRS  ·  终端电阻：开启");
+        var adapter = new Tile("适配器信息", "USBCANFD-200U · 标准帧 · BRS · 终端：开启");
         adapter.ValueLabel.Font = UiTheme.Font(10.5F, FontStyle.Bold);
+        var mapped = new Tile("已映射电机 ID");
+        _mappedIdLabel = mapped.ValueLabel;
+        _mappedIdLabel.Font = UiTheme.Font(10.5F, FontStyle.Bold);
         grid.Controls.Add(connection, 0, 0); grid.Controls.Add(nodes, 1, 0);
         grid.Controls.Add(traffic, 2, 0); grid.Controls.Add(speed, 3, 0);
-        grid.Controls.Add(adapter, 0, 1); grid.SetColumnSpan(adapter, 4);
+        grid.Controls.Add(adapter, 0, 1); grid.SetColumnSpan(adapter, 2);
+        grid.Controls.Add(mapped, 2, 1); grid.SetColumnSpan(mapped, 2);
 
         var operations = Grid(2, 1);
         _openCloseButton = NewButton("打开设备", 140, 52, BtnKind.Primary);
@@ -310,11 +316,12 @@ public sealed partial class MainForm
     private void RefreshMotorDisplayNames()
     {
         int selectedIndex = _motorCombo.SelectedIndex;
-        for (int i = 0; i < _motorCardTitles.Length; i++)
+        for (int row = 0; row < MotorDisplayOrder.Length; row++)
         {
+            int i = MotorDisplayOrder[row];
             string name = MotorDisplayName(i);
             _motorCardTitles[i].Text = name;
-            if (!Equals(_motorCombo.Items[i], name)) _motorCombo.Items[i] = name;
+            if (!Equals(_motorCombo.Items[row], name)) _motorCombo.Items[row] = name;
         }
         _motorCombo.SelectedIndex = selectedIndex;
         _motorCombo.Invalidate();
@@ -322,12 +329,14 @@ public sealed partial class MainForm
 
     private SectionCard BuildMappingSection()
     {
-        var card = new SectionCard("关节选择", 816);
-        var content = Grid(1, 10);
+        var card = new SectionCard("关节选择", JointPageHeight);
+        int motorCount = _registry.Motors.Count;
+        var content = Grid(1, motorCount + 5);
         content.RowStyles.Clear();
-        for (int i = 0; i < 4; i++)
+        for (int row = 0; row < motorCount; row++)
         {
-            int index = i;
+            int displayIndex = row;
+            int i = MotorDisplayOrder[row];
             var motor = _registry.Motors[i];
             var tile = new SurfacePanel { Dock = DockStyle.Fill, Margin = new Padding(0, 0, 0, 10),
                 Padding = new Padding(13, 10, 13, 10), Cursor = Cursors.Hand };
@@ -356,42 +365,49 @@ public sealed partial class MainForm
             _onlineLabels[i].Margin = new Padding(18, 0, 0, 0);
             bottom.Controls.AddRange(new System.Windows.Forms.Control[] { id, _idNums[i], _onlineLabels[i] });
             tile.Controls.Add(bottom); tile.Controls.Add(header);
-            tile.Click += (_, _) => _motorCombo.SelectedIndex = index;
-            header.Click += (_, _) => _motorCombo.SelectedIndex = index;
-            name.Click += (_, _) => _motorCombo.SelectedIndex = index;
-            angle.Click += (_, _) => _motorCombo.SelectedIndex = index;
+            void SelectMotor(object? sender, EventArgs e) => _motorCombo.SelectedIndex = displayIndex;
+            tile.Click += SelectMotor;
+            header.Click += SelectMotor;
+            name.Click += SelectMotor;
+            angle.Click += SelectMotor;
             // Child controls do not bubble Click to the card, including blank space in this row.
-            bottom.Click += (_, _) => _motorCombo.SelectedIndex = index;
-            id.Click += (_, _) => _motorCombo.SelectedIndex = index;
-            _onlineLabels[i].Click += (_, _) => _motorCombo.SelectedIndex = index;
-            tile.MouseEnter += (_, _) => { if (index != CurrentLogicalIndex) { tile.StrokeColor = AccentColor; tile.Invalidate(); } };
+            bottom.Click += SelectMotor;
+            id.Click += SelectMotor;
+            _onlineLabels[i].Click += SelectMotor;
+            tile.MouseEnter += (_, _) => { if (i != CurrentLogicalIndex) { tile.StrokeColor = AccentColor; tile.Invalidate(); } };
             tile.MouseLeave += (_, _) => UpdateMotorSelection();
             _tips.SetToolTip(tile, $"{motor.Model} · 点击选择此关节");
-            content.Controls.Add(tile, 0, i);
+            content.Controls.Add(tile, 0, row);
             content.RowStyles.Add(new RowStyle(SizeType.Absolute, 93));
         }
         var save = NewButton("保存映射与参数", 210, 52);
         _saveMappingButton = save;
         save.Dock = DockStyle.Fill; save.Margin = new Padding(0, 4, 0, 6);
         save.Click += (_, _) => OnSaveMapping();
-        content.Controls.Add(save, 0, 4); content.RowStyles.Add(new RowStyle(SizeType.Absolute, 62));
-        var version = new SurfacePanel { Dock = DockStyle.Fill, FillColor = TileColor, Padding = new Padding(12), Margin = Padding.Empty };
+        _tips.SetToolTip(save, "关闭设备后，可保存电机映射及各轴的目标角度、速度、加速度和点动增量。");
+        content.Controls.Add(save, 0, motorCount); content.RowStyles.Add(new RowStyle(SizeType.Absolute, 62));
+        const int lowerRowHeight = 66;
+        var lowerRowMargin = new Padding(0, 10, 0, 0);
+        var version = new SurfacePanel
+        {
+            Dock = DockStyle.Fill, FillColor = TileColor,
+            Padding = new Padding(12, 4, 12, 4), Margin = lowerRowMargin,
+        };
         var versionTitle = Caption("型号 · 版本", 9.5F);
-        versionTitle.Dock = DockStyle.Top; versionTitle.Height = 24; versionTitle.AutoSize = false;
+        versionTitle.Dock = DockStyle.Top; versionTitle.Height = 22; versionTitle.AutoSize = false;
+        versionTitle.TextAlign = ContentAlignment.MiddleLeft;
         _firmwareLabel = new Label { Text = $"{_registry.Motors[0].Model} · —", Dock = DockStyle.Fill, ForeColor = TextMain, BackColor = Color.Transparent, Font = UiTheme.Font(10.5F), TextAlign = ContentAlignment.MiddleLeft };
         version.Controls.Add(_firmwareLabel);
         version.Controls.Add(versionTitle);
-        content.Controls.Add(version, 0, 5); content.RowStyles.Add(new RowStyle(SizeType.Absolute, 88));
-        _returnAllZeroButton = CreateReturnAllZeroButton();
-        _returnAllZeroButton.Margin = new Padding(0, 16, 0, 0);
-        content.Controls.Add(_returnAllZeroButton, 0, 6); content.RowStyles.Add(new RowStyle(SizeType.Absolute, 72));
-        _enableAllButton = NewButton("全部使能", kind: BtnKind.Primary);
-        _enableAllButton.Dock = DockStyle.Fill; _enableAllButton.Margin = new Padding(0, 10, 0, 0);
-        _enableAllButton.Click += (_, _) => RunMotorOp("全部使能", () => _controller.EnableAll(JogAccel, PpProfileSpeed));
-        content.Controls.Add(_enableAllButton, 0, 7); content.RowStyles.Add(new RowStyle(SizeType.Absolute, 66));
+        content.Controls.Add(version, 0, motorCount + 1); content.RowStyles.Add(new RowStyle(SizeType.Absolute, lowerRowHeight));
+        _enableAllButton = NewButton("六轴使能", kind: BtnKind.Primary);
+        _enableAllButton.Dock = DockStyle.Fill; _enableAllButton.Margin = lowerRowMargin;
+        _enableAllButton.Click += (_, _) => RunMotorOp("六轴使能", _controller.EnableAll);
+        _tips.SetToolTip(_enableAllButton, "检查六个关节的反馈和故障状态，再批量使能并保持各自当前位置。");
+        content.Controls.Add(_enableAllButton, 0, motorCount + 2); content.RowStyles.Add(new RowStyle(SizeType.Absolute, lowerRowHeight));
         _eStopButton = CreateEmergencyStopButton();
-        _eStopButton.Margin = new Padding(0, 10, 0, 0);
-        content.Controls.Add(_eStopButton, 0, 8); content.RowStyles.Add(new RowStyle(SizeType.Absolute, 66));
+        _eStopButton.Margin = lowerRowMargin;
+        content.Controls.Add(_eStopButton, 0, motorCount + 3); content.RowStyles.Add(new RowStyle(SizeType.Absolute, lowerRowHeight));
         content.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         card.Content.Controls.Add(content);
         return card;
@@ -473,7 +489,10 @@ public sealed partial class MainForm
         _targetAngleNum.Minimum = -178.90M; _targetAngleNum.Maximum = 178.90M; _targetAngleNum.Increment = 0.5M;
         _jogSpeedNum = NewNum(0, 5, 1, 130); _jogSpeedNum.DecimalPlaces = 2; _jogSpeedNum.Minimum = 0.05M; _jogSpeedNum.Increment = 0.05M;
         _jogAccelNum = NewNum(0, 50, 5, 130); _jogAccelNum.DecimalPlaces = 2; _jogAccelNum.Minimum = 0.1M; _jogAccelNum.Increment = 0.1M;
-        parameters.Controls.Add(NumberField("绝对目标角度 · °", _targetAngleNum), 0, 0);
+        var targetField = NumberField("绝对目标角度 · °", _targetAngleNum);
+        _targetAngleCaption = targetField.Controls.OfType<Label>().Single();
+        _targetAngleCaption.AutoEllipsis = true;
+        parameters.Controls.Add(targetField, 0, 0);
         parameters.Controls.Add(NumberField("轨迹速度 · rpm", _jogSpeedNum), 1, 0);
         parameters.Controls.Add(NumberField("轨迹加速度 · rpm/s", _jogAccelNum), 2, 0);
         grid.Controls.Add(parameters, 0, 4); grid.RowStyles.Add(new RowStyle(SizeType.Absolute, 82));

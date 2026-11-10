@@ -63,7 +63,7 @@ internal static class WholeBodyTests
         var stopFrames = bus.Frames.Skip(emergencyStart).ToArray();
         Check(registry.Motors.All(axis => stopFrames.Any(frame =>
             frame.Id == Od.PdoBase + (uint)axis.DeviceId && frame.Data.All(value => value == 0))),
-            "emergency sends disable and brake commands to all four mapped axes");
+            "emergency sends disable and brake commands to all six mapped axes");
         int afterEmergency = bus.Frames.Count;
         wbc.Tick(.005, MotorFeedback.Now);
         Check(bus.Frames.Skip(afterEmergency).All(frame => frame.Id == Od.SyncId),
@@ -134,7 +134,7 @@ internal static class WholeBodyTests
         bus.Refresh(false);
         wbc.Tick(.005, MotorFeedback.Now);
         wbc.Arm(new Dictionary<int,string>());bus.FailBatch=true;wbc.Tick(.005,MotorFeedback.Now);Check(wbc.State==GroupState.FaultLatched,"partial batch faults group");
-        Check(bus.Frames.TakeLast(4).Select(frame => frame.Id).SequenceEqual(registry.Motors.Select(axis => Od.PdoBase + (uint)axis.DeviceId))
+        Check(bus.Frames.TakeLast(4).Select(frame => frame.Id).SequenceEqual(registry.WaistMotors.Select(axis => Od.PdoBase + (uint)axis.DeviceId))
             && bus.Frames.TakeLast(4).All(frame => frame.Data[0] == 0), "partial disable batch is retried for all four axes");
         Console.WriteLine($"PASS WBC v2: {count} assertions; simulated transport only.");
     }
@@ -391,7 +391,7 @@ internal static class WholeBodyTests
         wbc.Tick(.005, now);
         foreach (double descent in new[] { .001, .010 })
         {
-            var measured = registry.Motors.Select((axis, i) =>
+            var measured = registry.WaistMotors.Select((axis, i) =>
                 calibration.ToJoint(i, bus.GetFeedback(axis.DeviceId)!.PositionRaw)).ToArray();
             var pose = DiskKinematics.Forward(measured);
             var plan = MotionPlan.CreateMoveL(robot, calibration, measured, pose with { Z = pose.Z - descent },
@@ -408,7 +408,7 @@ internal static class WholeBodyTests
         }
 
         bus.Refresh(true);
-        var last = registry.Motors.Select((axis, i) =>
+        var last = registry.WaistMotors.Select((axis, i) =>
             calibration.ToJoint(i, bus.GetFeedback(axis.DeviceId)!.PositionRaw)).ToArray();
         var zeroPlan = MotionPlan.CreateSmoothToZero(robot, calibration, last, 1, 1);
         int zeroStart = bus.Frames.Count;
@@ -422,9 +422,9 @@ internal static class WholeBodyTests
         }
         Check(wbc.State == GroupState.Holding && legacy.WholeBodyOwned,
             "CSP zero return settles without releasing ownership");
-        Check(registry.Motors.All(axis => bus.GetFeedback(axis.DeviceId)!.PositionRaw == 0),
+        Check(registry.WaistMotors.All(axis => bus.GetFeedback(axis.DeviceId)!.PositionRaw == 0),
             "CSP zero return reaches exactly four zero encoder targets");
-        var zeroFeedback = registry.Motors.Select((axis, i) =>
+        var zeroFeedback = registry.WaistMotors.Select((axis, i) =>
             calibration.ToJoint(i, bus.GetFeedback(axis.DeviceId)!.PositionRaw)).ToArray();
         Check(wbc.MotionStatus.TargetReached && DiskKinematics.Matches(new TaskPose(.066, .972, 0, 0), zeroFeedback),
             "CSP reports arrival at height 972 mm, fore/aft 66 mm, pitch and yaw zero");
@@ -440,7 +440,7 @@ internal static class WholeBodyTests
             "CSP zero return rejects a zero target outside calibration");
 
         bus.Refresh(true);
-        last = registry.Motors.Select((axis, i) =>
+        last = registry.WaistMotors.Select((axis, i) =>
             calibration.ToJoint(i, bus.GetFeedback(axis.DeviceId)!.PositionRaw)).ToArray();
         var next = MotionPlan.CreateMoveL(robot, calibration, last,
             DiskKinematics.Forward(last) with { Z = DiskKinematics.Forward(last).Z - .005 }, 2.2, 2.2);

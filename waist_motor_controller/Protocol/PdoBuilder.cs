@@ -42,6 +42,6 @@ public static class PdoBuilder
         return new CanFrame(Od.PdoBase + (uint)deviceId, data, isFd: true, brs: true);
     }
 
-    // 只发定向单轴帧；不使用 0x200 广播，避免影响总线上的另外两台电机。
+    // 运动命令只发定向单轴帧；同步帧只请求反馈。
     public static CanFrame Sync() => new(Od.SyncId, ReadOnlySpan<byte>.Empty, isFd: true, brs: true);
 }

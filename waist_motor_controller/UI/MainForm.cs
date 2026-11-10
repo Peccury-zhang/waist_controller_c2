@@ -1,6 +1,7 @@
 using waist_motor_controller.Can;
 using waist_motor_controller.Control;
 using waist_motor_controller.Protocol;
+using WaistModel;
 
 namespace waist_motor_controller.UI;
 
@@ -18,23 +19,28 @@ public sealed partial class MainForm : Form
     private readonly MotorRegistry _registry;
     private readonly KeepaliveScheduler _keepalive;
     private readonly MotorController _controller;
+    private readonly CalibrationStore _calibrationStore = new();
 
     // 框栏①：CANFD 连接
     private Label _connStateLabel = null!;
     private Label _busIdLabel = null!;
+    private Label _mappedIdLabel = null!;
     private Label _rxTxLabel = null!;
     private Button _openCloseButton = null!;
     private Button _changeIdButton = null!;
     private Button _eStopButton = null!;
 
     // 框栏②：电机 ID 映射
-    private readonly NumericUpDown[] _idNums = new NumericUpDown[4];
-    private readonly Label[] _onlineLabels = new Label[4];
+    private readonly NumericUpDown[] _idNums = new NumericUpDown[AppConfig.MotorCount];
+    private readonly Label[] _onlineLabels = new Label[AppConfig.MotorCount];
 
     // 框栏③：单电机控制
     private ComboBox _motorCombo = null!;
     private ComboBox _directionCombo = null!;
-    private readonly int[] _pendingDirections = new int[4];
+    private readonly int[] _pendingDirections = new int[AppConfig.MotorCount];
+    private readonly ProfileConfig[] _jointProfiles = new ProfileConfig[AppConfig.MotorCount];
+    private int _profileIndex = -1;
+    private bool _switchingJointProfile;
     private Label _posLabel = null!;
     private Label _velLabel = null!;
     private Label _modeLabel = null!;
@@ -48,6 +54,7 @@ public sealed partial class MainForm : Form
     private Button _clearErrButton = null!;
     private Button _setZeroButton = null!;
     private NumericUpDown _targetAngleNum = null!;
+    private Label _targetAngleCaption = null!;
     private Button _moveButton = null!;
     private Button _returnZeroButton = null!;
     private NumericUpDown _jogSpeedNum = null!;
@@ -56,6 +63,7 @@ public sealed partial class MainForm : Form
     private Button _jogRevButton = null!;
     private Button _stopMotionButton = null!;
     private NumericUpDown _jogStepNum = null!;
+    private double _jogStepDegrees;
     private readonly Dictionary<int, string> _firmware = new();
     private readonly string _logPath = Path.Combine(Application.StartupPath, "logs", $"session-{DateTime.Now:yyyyMMdd-HHmmss}-{Environment.ProcessId}.log");
     private int _session;
@@ -81,7 +89,7 @@ public sealed partial class MainForm : Form
         _registry = new MotorRegistry(Path.Combine(configDir, "motors.json"));
         _keepalive = new KeepaliveScheduler(f => _transport.Send(f), CanContinuePosition,
             id => _registry.Motors.Any(m => m.DeviceId == id && m.UseFirmware117Pdo));
-        _controller = new MotorController(_transport, _keepalive, _registry);
+        _controller = new MotorController(_transport, _keepalive, _registry, _calibrationStore);
 
         _transport.Log += OnLogFromThread;
         _transport.FrameReceived += f => OnLogFromThread($"RX {f}");
@@ -96,6 +104,12 @@ public sealed partial class MainForm : Form
         Font = UiTheme.Font(11);
         BuildUi();
         LoadConfigToUi();
+        _jogStepDegrees = (double)_jogStepNum.Value;
+        _jogStepNum.ValueChanged += (_, _) =>
+        {
+            _jogStepDegrees = (double)_jogStepNum.Value;
+            if (!_switchingJointProfile) RefreshStatus();
+        };
 
         _uiTimer = new System.Windows.Forms.Timer { Interval = 100 };
         _uiTimer.Tick += (_, _) => RefreshStatus();
@@ -145,7 +159,7 @@ public sealed partial class MainForm : Form
 
     // ================= 辅助 =================
 
-    private int CurrentLogicalIndex => Math.Max(0, _motorCombo.SelectedIndex);
+    private int CurrentLogicalIndex => MotorDisplayOrder[Math.Max(0, _motorCombo.SelectedIndex)];
 
     private int CurrentDeviceId => _registry.Motors[CurrentLogicalIndex].DeviceId;
 
@@ -155,15 +169,54 @@ public sealed partial class MainForm : Form
 
     private void LoadConfigToUi()
     {
-        _jogSpeedNum.Value = (decimal)Math.Clamp(_registry.Config.Profile.OutputSpeedRpm, 0.05, 5);
-        _jogAccelNum.Value = (decimal)Math.Clamp(_registry.Config.Profile.OutputAccelRpmPerSec, 0.1, 50);
-        _jogStepNum.Value = (decimal)Math.Clamp(_registry.Config.Profile.JogStepDeg, 0.01, 30);
-        for (int i = 0; i < 4; i++)
+        for (int i = 0; i < _idNums.Length; i++)
         {
-            _idNums[i].Value = Math.Clamp(_registry.Motors[i].DeviceId, 1, 127);
-            _pendingDirections[i] = _registry.Motors[i].Direction;
+            var motor = _registry.Motors[i];
+            _idNums[i].Value = Math.Clamp(motor.DeviceId, 1, 127);
+            _pendingDirections[i] = motor.Direction;
+            // Older files only have one common profile. Use it as the initial value for each axis.
+            _jointProfiles[i] = motor.Profile ?? _registry.Config.Profile;
         }
+        ShowSelectedJointProfile();
         UpdateDirectionUi();
+    }
+
+    private void CaptureJointProfile()
+    {
+        if (_profileIndex < 0) return;
+        _jointProfiles[_profileIndex] = new ProfileConfig
+        {
+            TargetDeg = (double)_targetAngleNum.Value,
+            OutputSpeedRpm = PpProfileSpeed,
+            OutputAccelRpmPerSec = JogAccel,
+            JogStepDeg = (double)_jogStepNum.Value,
+        };
+    }
+
+    private void ShowSelectedJointProfile()
+    {
+        int index = CurrentLogicalIndex;
+        if (index == _profileIndex) return;
+        _switchingJointProfile = true;
+        try
+        {
+            CaptureJointProfile();
+            _profileIndex = index;
+            var profile = _jointProfiles[index];
+            UpdateTargetAngleRange(_controller.GetJointLimits(_registry.Motors[index]));
+            SetProfileValue(_targetAngleNum, profile.TargetDeg, 0);
+            SetProfileValue(_jogSpeedNum, profile.OutputSpeedRpm, 1);
+            SetProfileValue(_jogAccelNum, profile.OutputAccelRpmPerSec, 5);
+            SetProfileValue(_jogStepNum, profile.JogStepDeg, 1);
+        }
+        finally { _switchingJointProfile = false; }
+    }
+
+    private static void SetProfileValue(NumericUpDown input, double value, double fallback)
+    {
+        double requested = double.IsFinite(value) ? value : fallback;
+        decimal bounded = (decimal)Math.Clamp(requested, (double)input.Minimum, (double)input.Maximum);
+        input.Value = Math.Clamp(bounded, input.Minimum, input.Maximum);
     }
 
     private void UpdateDirectionUi()
@@ -180,6 +233,12 @@ public sealed partial class MainForm : Form
     {
         if (!_transport.IsOpen)
         {
+            if (!_registry.HasUniqueDeviceIds)
+            {
+                MessageBox.Show(this, "CAN ID 存在重复。请在关节控制页修正并保存映射后再打开设备。", "打开设备",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
             string dll = Path.Combine(Application.StartupPath, "ControlCANFD.dll");
             if (!File.Exists(dll))
             {
@@ -190,6 +249,7 @@ public sealed partial class MainForm : Form
 
             int devIdx = Math.Clamp(_registry.Config.Can.DeviceIndex, 0, 15);
             int channel = Math.Clamp(_registry.Config.Can.Channel, 0, 3);
+            _controller.ReloadJointLimits();
             _transport.ConfigureFirmware117(_registry.Motors.Where(m => m.UseFirmware117Pdo).Select(m => m.DeviceId));
             if (!_transport.Open(devIdx, channel, out string err))
             {
@@ -277,7 +337,8 @@ public sealed partial class MainForm : Form
 
     private async Task OnSetZero()
     {
-        var devId = CurrentDeviceId;
+        var motor = _registry.Motors[CurrentLogicalIndex];
+        int devId = motor.DeviceId;
         if (_controller.IsJogging(devId) || !_controller.IsAtTarget(devId))
         {
             ShowNotice("请先停止并等待电机到位，再设置零位。");
@@ -294,7 +355,7 @@ public sealed partial class MainForm : Form
         try
         {
             var (ok, msg) = await _controller.SetZeroOriginAsync(devId, JogAccel, PpProfileSpeed);
-            _wholeBodyPage?.InvalidateCalibration();
+            if (!motor.IsHead) _wholeBodyPage?.InvalidateCalibration();
             if (!ok)
                 MessageBox.Show(this, msg, "标零失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             else
@@ -342,17 +403,16 @@ public sealed partial class MainForm : Form
     {
         if (_transport.IsOpen) { AppendLog("请先关闭设备再保存映射及参数"); return; }
         // 检查 ID 重复
-        var ids = new List<int>();
-        for (int i = 0; i < 4; i++)
-            ids.Add((int)_idNums[i].Value);
-        if (ids.Distinct().Count() != 4)
+        var ids = _idNums.Select(number => (int)number.Value).ToArray();
+        if (ids.Distinct().Count() != ids.Length)
         {
-            MessageBox.Show(this, "4 个电机的总线 ID 存在重复，请修正后再保存。", "保存映射",
+            MessageBox.Show(this, "电机的总线 ID 存在重复，请修正后再保存。", "保存映射",
                 MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return;
         }
 
-        for (int i = 0; i < 4; i++)
+        var previousIds = _registry.Motors.Select(m => m.DeviceId).ToArray();
+        for (int i = 0; i < ids.Length; i++)
         {
             var motor = _registry.Motors[i];
             int newId = ids[i];
@@ -363,13 +423,23 @@ public sealed partial class MainForm : Form
                 _registry.SetDeviceId(motor.LogicalId, newId);
             }
         }
-        _registry.Config.Profile.OutputSpeedRpm = PpProfileSpeed;
-        _registry.Config.Profile.OutputAccelRpmPerSec = JogAccel;
-        _registry.Config.Profile.JogStepDeg = (double)_jogStepNum.Value;
+        CaptureJointProfile();
+        var previousProfiles = _registry.Motors.Select(m => m.Profile).ToArray();
         int[] previousDirections = _registry.Motors.Select(m => m.Direction).ToArray();
-        for (int i = 0; i < _pendingDirections.Length; i++) _registry.Motors[i].Direction = _pendingDirections[i];
+        for (int i = 0; i < _pendingDirections.Length; i++)
+        {
+            _registry.Motors[i].Direction = _pendingDirections[i];
+            _registry.Motors[i].Profile = _jointProfiles[i];
+        }
         if (!_registry.Save())
-            for (int i = 0; i < previousDirections.Length; i++) _registry.Motors[i].Direction = previousDirections[i];
+        {
+            for (int i = 0; i < previousDirections.Length; i++)
+            {
+                _registry.Motors[i].DeviceId = previousIds[i];
+                _registry.Motors[i].Direction = previousDirections[i];
+                _registry.Motors[i].Profile = previousProfiles[i];
+            }
+        }
         RefreshMotorDisplayNames();
         RefreshStatus();
     }
@@ -389,7 +459,8 @@ public sealed partial class MainForm : Form
                 if (version != null) AppendLog($"ID {m.DeviceId} 仅CAN2.0版本读取成功：请核对电机服务报文格式");
             }
             _firmware[m.DeviceId] = version ?? "未读到";
-            AppendLog($"ID {m.DeviceId} {m.Model} 软件版本：{version ?? "未读到"}；预期 {m.ExpectedFirmware}");
+            string expected = string.IsNullOrEmpty(m.ExpectedFirmware) ? "" : $"；预期 {m.ExpectedFirmware}";
+            AppendLog($"ID {m.DeviceId} {m.Model} 软件版本：{version ?? "未读到"}{expected}");
         }
         _readingFirmware = false;
         AppendLog("通信诊断：" + _transport.GetBusDiagnostics());
@@ -407,25 +478,27 @@ public sealed partial class MainForm : Form
     {
         bool open = _transport.IsOpen;
         long now = Environment.TickCount64;
-        var alive = new List<string>();
+        var alive = new List<int>();
         int selectedIndex = CurrentLogicalIndex;
         var motor = _registry.Motors[selectedIndex];
         int idSelected = motor.DeviceId;
         MotorFeedback? fb = null;
-        for (int i = 0; i < 4; i++)
+        for (int i = 0; i < _idNums.Length; i++)
         {
             var mappedMotor = _registry.Motors[i];
             int id = mappedMotor.DeviceId;
             bool online = open && _transport.IsDeviceAlive(id);
             var feedback = online ? _transport.GetFeedback(id) : null;
             if (i == selectedIndex) fb = feedback;
-            if (online) alive.Add(id.ToString());
+            if (online) alive.Add(id);
             UiValueCache.Text(_onlineLabels[i], online ? "● 在线" : "● 离线");
             UiValueCache.Color(_onlineLabels[i], online ? OkColor : TextSub);
             UiValueCache.Text(_motorCardAngles[i], JointAngleText(feedback, mappedMotor.Direction));
             UiValueCache.Color(_motorCardAngles[i], feedback is null ? TextSub : UiTheme.ValueBlue);
         }
-        UiValueCache.Text(_busIdLabel, open ? alive.Count == 0 ? "无" : string.Join(", ", alive) : "--");
+        UiValueCache.Text(_busIdLabel, open ? alive.Count == 0 ? "无" : string.Join(", ", alive.Order()) : "--");
+        UiValueCache.Text(_mappedIdLabel, $"头部 {string.Join("、", _registry.HeadMotors.Select(m => m.DeviceId))} · " +
+            $"腰部 {string.Join("、", _registry.WaistMotors.Select(m => m.DeviceId))}");
         if (!open || now - _lastCountersUiTick >= 500)
         {
             _lastCountersUiTick = now;
@@ -462,22 +535,52 @@ public sealed partial class MainForm : Form
         bool moving = _controller.IsJogging(idSelected) || (armed && fb?.Enabled == true && !atTarget);
         ApplyOperationState(new OperationUiState(open, fb != null, faulted, _controller.IsBusy(idSelected),
             armed, fb?.Enabled == true, _readingFirmware,
-            _controller.IsWithinEnableWindow(idSelected), moving, atTarget, clearable));
+            _controller.IsWithinEnableWindow(idSelected), moving, atTarget, clearable),
+            fb?.PositionDeg * motor.Direction);
     }
 
-    internal void ApplyOperationState(OperationUiState state)
+    private void UpdateTargetAngleRange((double Minimum, double Maximum)? limits)
     {
-        UiValueCache.Enabled(_returnAllZeroButton, state.Connected);
-        UiValueCache.Enabled(_enableAllButton, state.Connected);
+        UiValueCache.Enabled(_targetAngleNum, limits.HasValue);
+        if (limits is not { } range)
+        {
+            UiValueCache.Text(_targetAngleCaption, "绝对目标角度 · 标定无效");
+            return;
+        }
+
+        decimal minimum = range.Minimum == Od.MinAngle ? -178.90M : (decimal)range.Minimum;
+        decimal maximum = range.Maximum == Od.MaxAngle ? 178.90M : (decimal)range.Maximum;
+        if (minimum > maximum) (minimum, maximum) = ((decimal)range.Minimum, (decimal)range.Maximum);
+        if (_targetAngleNum.Minimum != minimum || _targetAngleNum.Maximum != maximum)
+        {
+            int Scale(decimal value) => (decimal.GetBits(value)[3] >> 16) & 0xff;
+            _targetAngleNum.DecimalPlaces = Math.Max(2, Math.Max(Scale(minimum), Scale(maximum)));
+            _targetAngleNum.Minimum = minimum;
+            _targetAngleNum.Maximum = maximum;
+        }
+        string rangeText = $"{minimum:G29}～{maximum:G29}°";
+        UiValueCache.Text(_targetAngleCaption, $"目标角度 {rangeText}");
+        _uiValues.Tip(_tips, _targetAngleCaption, $"绝对目标角度允许范围 {rangeText}");
+    }
+
+    internal void ApplyOperationState(OperationUiState state, double? currentJointAngle = null)
+    {
+        var motor = _registry.Motors[CurrentLogicalIndex];
+        var limits = _controller.GetJointLimits(motor);
+        UpdateTargetAngleRange(limits);
+        double step = _jogStepDegrees;
+        UiValueCache.Enabled(_enableAllButton, state.Connected && !_controller.WholeBodyOwned);
         UiValueCache.Enabled(_enableButton, state.Connected && state.FeedbackFresh && !state.Faulted && !state.Configuring && !state.Armed);
         UiValueCache.Enabled(_disableButton, state.Connected && (state.Armed || (state.FeedbackFresh && state.MotorEnabled)));
         UiValueCache.Enabled(_clearErrButton, state.Connected && state.FeedbackFresh && state.Faulted && !state.Configuring && state.CommandClearable);
         // 不再随每次点动闪成禁用色。重入、保护期和标零到位检查在操作入口及控制层执行。
         UiValueCache.Enabled(_setZeroButton, state.CanCommand && !state.ReadingFirmware);
-        UiValueCache.Enabled(_moveButton, state.CanCommand);
-        UiValueCache.Enabled(_returnZeroButton, state.CanCommand);
-        UiValueCache.Enabled(_jogFwdButton, state.CanCommand);
-        UiValueCache.Enabled(_jogRevButton, state.CanCommand);
+        UiValueCache.Enabled(_moveButton, state.CanCommand && limits.HasValue);
+        UiValueCache.Enabled(_returnZeroButton, state.CanCommand && MotorController.InJointRange(limits, 0));
+        UiValueCache.Enabled(_jogFwdButton, state.CanCommand && currentJointAngle is double forward &&
+            MotorController.InJointRange(limits, forward + step));
+        UiValueCache.Enabled(_jogRevButton, state.CanCommand && currentJointAngle is double backward &&
+            MotorController.InJointRange(limits, backward - step));
         UiValueCache.Enabled(_stopMotionButton, state.Connected && !state.Configuring && state.Armed);
         UiValueCache.Text(_motionHint, state.CanCommand && Environment.TickCount64 < _noticeUntil ? _noticeText : state.Hint);
     }

@@ -59,6 +59,33 @@ internal static class WholeBodyPageTests
         Check(enabledChanges == 0, "a refresh with stale feedback never briefly enables the controls");
         bus.Valid = true;
         Refresh();
+        var headAngles = (Dictionary<string, double>)type.GetField("headAngles", flags)!.GetValue(page)!;
+        var parts = (System.Collections.IEnumerable)view.GetType().GetField("parts", flags)!.GetValue(view)!;
+        object MeshTransform(string link)
+        {
+            var part = parts.Cast<object>().First(entry =>
+                ((WaistModel.Visual)entry.GetType().GetField("Item1")!.GetValue(entry)!).Link == link);
+            var mesh = part.GetType().GetField("Item2")!.GetValue(part)!;
+            var transform = mesh.GetType().GetProperty("Transform")!.GetValue(mesh)!;
+            return transform.GetType().GetProperty("Value")!.GetValue(transform)!;
+        }
+        var waistTransform = MeshTransform("bady_link_4");
+        var neckTransform = MeshTransform("head_link_1");
+        var faceTransform = MeshTransform("head_link_2");
+        bus.HeadRaw[1] = -4096;
+        Refresh();
+        Check(Math.Abs(headAngles["head_joint_2"] + Math.PI / 8) < 1e-10 &&
+            Equals(MeshTransform("head_link_1"), neckTransform) && !Equals(MeshTransform("head_link_2"), faceTransform),
+            "ID 1 drives only the pitch joint, including negative measured angles");
+        bus.HeadRaw[2] = 4096;
+        registry.GetMotor(6).Direction = -1;
+        Refresh();
+        Check(Math.Abs(headAngles["head_joint_1"] + Math.PI / 8) < 1e-10 &&
+            !Equals(MeshTransform("head_link_1"), neckTransform) && Equals(MeshTransform("bady_link_4"), waistTransform),
+            "ID 2 drives the yaw joint with the saved direction, leaving the waist pose intact");
+        bus.HeadRaw.Clear();
+        Refresh();
+        Check(headAngles.Count == 2 && headAngles.Values.All(angle => angle < 0), "missing head feedback retains the last displayed angles");
         Check(motion.All(button => button.Enabled) && inputs[2].Enabled, "valid feedback enables motion and pitch controls");
         string ExpectedAngles() => string.Join(Environment.NewLine, bus.Raw.Select((raw, i) =>
             $"M{i + 1} {registry.Motors[i].Direction * Od.RawToAngle(raw),7:F2}°"));
@@ -101,7 +128,7 @@ internal static class WholeBodyPageTests
         inputs[1].Value = 60;
         Check(inputs[0].Value == 921, "manual X does not change height");
         inputs[0].Value = 466;
-        var calibration = page.Store.Load(registry.Motors.Select(m => m.Direction).ToArray());
+        var calibration = page.Store.Load(registry.WaistMotors.Select(m => m.Direction).ToArray());
         var centered = MotionPlan.ResolveCenteredEndpoint(calibration, new TaskPose(0, .466, 0, 0)).Pose;
         Check(inputs[0].Value == 466 && Math.Abs((double)inputs[1].Value - centered.X * 1000) < .0001,
             "a deep fold uses the feasible X closest to center after a manual X edit");
@@ -130,7 +157,42 @@ internal static class WholeBodyPageTests
         Check(bus.Sent == 0, "UI checks never send motor commands");
         CheckTrackingLayout(page, calibration);
         CheckPointManagement();
+        CheckHeadCalibration();
         Console.WriteLine("PASS WBC page: feedback, jog, reconnect and saved points; simulated transport only.");
+    }
+
+    private static void CheckHeadCalibration()
+    {
+        string dir = Path.Combine(Path.GetTempPath(), "r48-calibration-" + Guid.NewGuid());
+        string path = Path.Combine(dir, "motors.json");
+        var waistStore = new CalibrationStore(Path.Combine(dir, "waist.json"));
+        var registry = new MotorRegistry(path);
+        using var page = new CalibrationPage(waistStore, registry, () => false);
+        var grid = page.Controls.OfType<TableLayoutPanel>().Single();
+        var headRows = grid.Controls.OfType<Label>().Where(label => label.Text.Contains("head_joint_")).ToArray();
+        var boxes = headRows.Select(label => grid.GetRow(label)).Select(row => new[]
+        {
+            (TextBox)grid.GetControlFromPosition(1, row)!, (TextBox)grid.GetControlFromPosition(2, row)!,
+        }).ToArray();
+        if (headRows.Length != 2 || !headRows[0].Text.StartsWith("1号电机-头部点头 (head_joint_2)") ||
+            !headRows[1].Text.StartsWith("2号电机-头部摇头 (head_joint_1)") ||
+            !boxes.SelectMany(pair => pair).Select(box => box.Text).SequenceEqual(new[] { "-40", "40", "0", "37" }))
+            throw new Exception("R48 calibration defaults or joint mappings are incorrect");
+        try
+        {
+            boxes[0][0].Text = "-35";
+            boxes[1][1].Text = "36";
+            grid.Controls.OfType<Button>().Single(button => button.Text == "保存头部角度范围").PerformClick();
+            var ranges = new MotorRegistry(path).HeadMotors.Select(m => m.HeadLimits);
+            if (!ranges.SequenceEqual(new[] { new HeadAngleRange(-35, 40), new HeadAngleRange(0, 36) }) ||
+                File.Exists(waistStore.FilePath))
+                throw new Exception("Saving head ranges did not persist independently of waist calibration");
+        }
+        finally
+        {
+            File.Delete(path);
+            if (Directory.Exists(dir)) Directory.Delete(dir);
+        }
     }
 
     private static void CheckTrackingLayout(WholeBodyPage page, Calibration calibration)
@@ -298,14 +360,16 @@ internal static class WholeBodyPageTests
     private sealed class PageBus : ICanTransport
     {
         public short[] Raw = [100, 3000, 6000, 3000];
+        public readonly Dictionary<int, short> HeadRaw = new();
         public bool Valid = true;
         public int Sent;
         public bool IsOpen => true;
         public event Action<int, MotorFeedback>? FeedbackUpdated { add { } remove { } }
         public bool Send(CanFrame frame) { Sent++; return true; }
-        public MotorFeedback? GetFeedback(int id) => Valid ? new MotorFeedback
+        public MotorFeedback? GetFeedback(int id) => Valid && (id is >= 3 and <= 6 || HeadRaw.ContainsKey(id)) ? new MotorFeedback
         {
-            DeviceId = id, PositionRaw = Raw[id - 3], Timestamp = MotorFeedback.Now, IsFirmware117 = true,
+            DeviceId = id, PositionRaw = id is >= 3 and <= 6 ? Raw[id - 3] : HeadRaw[id],
+            Timestamp = MotorFeedback.Now, IsFirmware117 = true,
         } : null;
         public bool IsDeviceAlive(int id, int windowMs = 500) => Valid;
         public Task<SdoResponse?> SdoRequestAsync(int id, CanFrame request, int timeoutMs = 300) => Task.FromResult<SdoResponse?>(null);

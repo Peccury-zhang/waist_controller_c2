@@ -1,6 +1,7 @@
 using System.Reflection;
 using System.Text;
 using System.Text.Json;
+using WaistModel;
 using waist_motor_controller.Can;
 using waist_motor_controller.Control;
 using waist_motor_controller.Protocol;
@@ -200,10 +201,11 @@ internal static class Program
         try
         {
             var defaults = AppConfig.CreateDefault();
-            Assert(defaults.Motors.Select(m => m.DeviceId).SequenceEqual(new[] { 3, 4, 5, 6 }), "new IDs");
-            Assert(defaults.Motors.Select(m => m.Direction).SequenceEqual(new[] { -1, -1, 1, -1 }), "default joint direction signs");
+            Assert(defaults.Motors.Select(m => m.DeviceId).SequenceEqual(new[] { 3, 4, 5, 6, 1, 2 }), "six default IDs");
+            Assert(defaults.Motors.Select(m => m.Direction).SequenceEqual(new[] { -1, -1, 1, -1, 1, 1 }), "default joint direction signs");
             string config = Path.Combine(temp, "motors.json");
             defaults.SchemaVersion = 1;
+            defaults.Motors.RemoveAll(m => m.IsHead);
             for (int i = 0; i < 4; i++)
             {
                 defaults.Motors[i].DeviceId = 11 + i;
@@ -211,9 +213,20 @@ internal static class Program
             }
             File.WriteAllText(config, JsonSerializer.Serialize(defaults));
             var registry = new MotorRegistry(config);
-            Assert(registry.Motors.Select(m => m.Direction).SequenceEqual(new[] { -1, -1, 1, -1 }), "legacy configurations keep logical joint directions");
-            Assert(registry.Motors.Select(m => m.DeviceId).SequenceEqual(new[] { 3, 4, 5, 6 }), "legacy IDs migrated");
-            Assert(File.Exists(config + ".pre-v2.bak") && registry.Config.SchemaVersion == 2, "migration backup");
+            Assert(registry.WaistMotors.Select(m => m.Direction).SequenceEqual(new[] { -1, -1, 1, -1 }), "legacy configurations keep logical joint directions");
+            Assert(registry.Motors.Select(m => m.DeviceId).SequenceEqual(new[] { 3, 4, 5, 6, 1, 2 }), "legacy IDs migrated and head IDs appended");
+            Assert(File.Exists(config + ".pre-v2.bak") && registry.Config.SchemaVersion == 3, "migration backup");
+            Assert(registry.HeadMotors.Select(m => m.HeadJoint).SequenceEqual(new[] { "head_joint_2", "head_joint_1" }) &&
+                registry.HeadMotors.Select(m => m.HeadLimits).SequenceEqual(new[] { new HeadAngleRange(-40, 40), new HeadAngleRange(0, 37) }),
+                "R48 mapping and default calibrated ranges");
+            string collisionPath = Path.Combine(temp, "duplicate-head-id.json");
+            defaults.SchemaVersion = 2;
+            defaults.Motors[0].DeviceId = 1;
+            File.WriteAllText(collisionPath, JsonSerializer.Serialize(defaults));
+            var conflict = new MotorRegistry(collisionPath);
+            Assert(!conflict.HasUniqueDeviceIds && conflict.Motors[0].DeviceId == 1 && !conflict.Save(),
+                "preserve custom waist ID and require correction of a head ID collision");
+            defaults.SchemaVersion = 1;
             defaults.Motors[0].DeviceId = 21;
             File.WriteAllText(config, JsonSerializer.Serialize(defaults));
             Assert(new MotorRegistry(config).Motors[0].DeviceId == 21, "custom ID preserved");
@@ -221,12 +234,22 @@ internal static class Program
             Assert(customDirection.Motors[0].Direction == -1, "direction default follows logical joint, not CAN ID");
             customDirection.Motors[0].Direction = 1;
             Assert(customDirection.Save() && new MotorRegistry(config).Motors[0].Direction == 1, "custom joint direction survives save and reload");
+            Assert(customDirection.HeadMotors.All(m => m.Profile is null), "old common profile still loads without per-axis settings");
+            customDirection.GetMotor(5).Profile = new ProfileConfig { TargetDeg = -10, OutputSpeedRpm = 1, OutputAccelRpmPerSec = 5, JogStepDeg = .5 };
+            customDirection.GetMotor(6).Profile = new ProfileConfig { TargetDeg = 30, OutputSpeedRpm = 3, OutputAccelRpmPerSec = 8, JogStepDeg = 2 };
+            Assert(customDirection.Save(), "save motor-specific parameters");
+            var restoredProfiles = new MotorRegistry(config).HeadMotors.Select(m => m.Profile!).ToArray();
+            Assert(restoredProfiles[0].TargetDeg == -10 && restoredProfiles[0].OutputSpeedRpm == 1 &&
+                restoredProfiles[0].OutputAccelRpmPerSec == 5 && restoredProfiles[0].JogStepDeg == .5 &&
+                restoredProfiles[1].TargetDeg == 30 && restoredProfiles[1].OutputSpeedRpm == 3 &&
+                restoredProfiles[1].OutputAccelRpmPerSec == 8 && restoredProfiles[1].JogStepDeg == 2,
+                "four parameters persist independently for each logical motor");
 
             var fake = new FakeCan();
             var frames = new List<CanFrame>();
             var scheduler = new KeepaliveScheduler(f => { frames.Add(f); return fake.Send(f); });
             var controller = new MotorController(fake, scheduler, registry);
-            Assert(!controller.Enable(1, 5, 1).Ok, "unconfigured ID rejected");
+            Assert(!controller.Enable(7, 5, 1).Ok, "unconfigured ID rejected");
             fake.Alive = false;
             Assert(!controller.Enable(3, 5, 1).Ok, "stale feedback prevents enable");
             fake.Alive = true;
@@ -252,10 +275,10 @@ internal static class Program
             for (int i = 0; i < 20; i++) scheduler.Tick(0.001);
             int before = frames.Count;
             var eStop = controller.EmergencyStop();
-            Assert(eStop.Ok && frames.Count == before + 4, "four emergency frames");
-            Assert(frames.Skip(before).Select(f => f.Id).SequenceEqual(new uint[] { 0x103, 0x104, 0x105, 0x106 }), "only four IDs stopped");
+            Assert(eStop.Ok && frames.Count == before + 6, "six emergency frames");
+            Assert(frames.Skip(before).Select(f => f.Id).SequenceEqual(new uint[] { 0x103, 0x104, 0x105, 0x106, 0x101, 0x102 }), "all mapped IDs stopped");
             scheduler.Tick(0.1);
-            Assert(frames.Count == before + 4, "no enabled frame after emergency stop");
+            Assert(frames.Count == before + 6, "no enabled frame after emergency stop");
             Assert(frames.All(f => f.Id != 0x200), "no motor broadcast");
 
             Assert(controller.Enable(3, 5, 1).Ok, "re-enable after stop");
@@ -301,66 +324,102 @@ internal static class Program
             Assert(!scheduler.IsArmed(3), "cancel never re-enables");
             fake.Pending = null;
 
-            var groupRegistry = new MotorRegistry(config); // Includes a custom CAN ID, not hardcoded 3~6.
+            var groupRegistry = new MotorRegistry(config); // Includes a custom CAN ID.
             int[] groupIds = groupRegistry.Motors.Select(m => m.DeviceId).ToArray();
             var groupCan = new FakeCan();
-            var groupFrames = new List<CanFrame>();
-            var groupScheduler = new KeepaliveScheduler(f => { groupFrames.Add(f); return groupCan.Send(f); });
+            var groupScheduler = new KeepaliveScheduler(groupCan.Send, firmware117: _ => true);
             var groupController = new MotorController(groupCan, groupScheduler, groupRegistry);
-            for (int i = 0; i < groupIds.Length; i++) groupCan.Positions[groupIds[i]] = (short)((i % 2 == 0 ? 1 : -1) * (1000 + i * 100));
-            Assert(!groupController.ReturnAllToZero(5, 1).Ok && groupFrames.Count == 0, "all-zero never auto-enables motors");
-            foreach (int id in groupIds) Assert(groupController.Enable(id, 5, 1).Ok, "enable mapped joint for group test");
-            Assert(!groupController.ReturnAllToZero(5, 1).Ok, "all-zero respects enable protection period");
-            await Task.Delay(160);
-            bool Unchanged() => groupIds.All(id => groupScheduler.GetTarget(id) == groupCan.Positions[id]);
-            groupCan.OfflineIds.Add(groupIds[^1]);
-            Assert(!groupController.ReturnAllToZero(5, 1).Ok && Unchanged(), "one offline joint rejects entire group without changing any target");
+            for (int i = 0; i < groupIds.Length; i++)
+                groupCan.Positions[groupIds[i]] = (short)((i % 2 == 0 ? 1 : -1) * (1000 + i * 100));
+
+            groupCan.OfflineIds.Add(2);
+            Assert(!groupController.EnableAll().Ok && groupCan.SentFrames.Count == 0, "offline head prevents any group enable frames");
             groupCan.OfflineIds.Clear(); groupCan.Fault = 0x0100;
-            Assert(!groupController.ReturnAllToZero(5, 1).Ok && Unchanged(), "fault prevents group motion");
+            Assert(!groupController.EnableAll().Ok && groupCan.SentFrames.Count == 0, "fault prevents group enable");
             groupCan.Fault = 0;
-            Assert(!groupController.ReturnAllToZero(5, 99).Ok && Unchanged(), "invalid group profile cannot partly start");
-            Assert(groupController.MoveToPosition(groupIds[^1], 10, 5, 1).Ok, "start existing individual trajectory");
-            Assert(!groupController.ReturnAllToZero(5, 1).Ok && groupScheduler.GetTarget(groupIds[0]) == groupCan.Positions[groupIds[0]], "busy joint prevents other joints starting");
-            groupController.StopMotion(groupIds[^1]);
-            groupScheduler.ArmHold(1, 321);
-            groupFrames.Clear();
-            Assert(groupController.ReturnAllToZero(5, 1).Ok && groupIds.All(id => groupScheduler.GetTarget(id) == 0), "all mapped joints receive zero targets");
-            Assert(groupScheduler.GetTarget(1) == 321 && groupCan.SdoRequests.Count == 0, "all-zero does not change other joints or calibrate origins");
-            Assert(!groupController.ReturnAllToZero(5, 1).Ok, "repeated all-zero during motion rejected");
-            for (int i = 0; i < 10000 && groupIds.Any(groupScheduler.IsMoving); i++) groupScheduler.Tick(0.005);
-            Assert(groupIds.All(id => !groupScheduler.IsMoving(id)), "all group trajectories arrive at zero");
-            foreach (int id in groupIds) Assert(groupFrames.Last(f => f.Id == 0x100u + id).ReadBe16(1) == 0, "final position frame is zero");
+            Assert(groupController.TryAcquireWholeBody() && !groupController.EnableAll().Ok && groupCan.SentFrames.Count == 0,
+                "waist CSP ownership prevents group enable");
+            groupController.ReleaseWholeBody();
+
+            Assert(groupController.EnableAll().Ok && groupIds.All(groupScheduler.IsArmed), "all-enable arms all six mapped joints");
+            var batch = groupCan.Batches.Single();
+            Assert(batch.Length == 6 && batch.Select(f => (int)(f.Id - 0x100)).SequenceEqual(groupIds) &&
+                batch.All(f => f.Data[0] == 0xC2 && f.ReadBe16(1) == groupCan.Positions[(int)(f.Id - 0x100)]),
+                "one CAN FD batch enables six mapped joints and holds their measured positions");
+            Assert(groupIds.All(id => groupScheduler.GetTarget(id) == groupCan.Positions[id]), "all six local hold targets match feedback");
+            Assert(groupController.EnableAll().Ok && groupCan.Batches.Count == 1, "already armed joints are skipped");
+            Assert(new CanFdTransport().SendBatch(batch) == 0, "real transport accepts a six-frame batch without opening hardware");
+
             groupController.EmergencyStop();
-            Assert(groupIds.All(id => !groupScheduler.IsArmed(id)), "emergency stop cancels all-zero group");
-            Assert(groupController.Enable(groupIds[0], 5, 1).Ok && groupController.Enable(groupIds[2], 5, 1).Ok, "enable only two of the four mapped joints");
+            groupCan.SentFrames.Clear();
+            groupCan.BatchLimit = 2;
+            Assert(!groupController.EnableAll().Ok && groupIds.All(id => !groupScheduler.IsArmed(id)) &&
+                groupCan.SentFrames.Skip(2).Select(f => (int)(f.Id - 0x100)).SequenceEqual(groupIds) &&
+                groupCan.SentFrames.Skip(2).All(f => f.Data[0] == 0),
+                "partial batch failure disables all six and leaves no armed trajectories");
+
+            var headCan = new FakeCan();
+            var headScheduler = new KeepaliveScheduler(headCan.Send, firmware117: _ => true);
+            var headController = new MotorController(headCan, headScheduler, registry);
+            Assert(headController.Enable(1, 5, 1).Ok && headController.Enable(2, 5, 1).Ok, "both R48 axes can be enabled separately");
             await Task.Delay(160);
-            groupCan.OfflineIds.Add(groupIds[1]); // An unarmed/offline joint must not block enabled joints.
-            groupFrames.Clear();
-            var partialHome = groupController.ReturnAllToZero(5, 1);
-            Assert(partialHome.Ok && partialHome.Message.Contains("跳过") && partialHome.Message.Contains(groupIds[1].ToString()), "partial all-zero reports skipped joints");
-            Assert(groupScheduler.GetTarget(groupIds[0]) == 0 && groupScheduler.GetTarget(groupIds[2]) == 0, "only enabled subset receives zero targets");
-            Assert(!groupScheduler.IsArmed(groupIds[1]) && !groupScheduler.IsArmed(groupIds[3]), "disabled joints remain disabled");
-            groupScheduler.Tick(0.005);
-            Assert(!groupFrames.Any(f => f.Id == 0x100u + groupIds[1] || f.Id == 0x100u + groupIds[3]), "no frames sent to skipped mapped joints");
-            groupController.EmergencyStop();
-            groupFrames.Clear();
-            Assert(!groupController.ReturnAllToZero(5, 1).Ok && groupFrames.Count == 0, "no enabled joints produces no commands");
-            groupCan.OfflineIds.Clear();
-            groupCan.OfflineIds.Add(groupIds[^1]);
-            Assert(!groupController.EnableAll(5, 1).Ok && groupFrames.Count == 0, "all-enable prechecks all mapped joints before sending");
-            groupCan.OfflineIds.Clear(); groupCan.Fault = 0x0100;
-            Assert(!groupController.EnableAll(5, 1).Ok && groupFrames.Count == 0, "all-enable does not override faults");
-            groupCan.Fault = 0;
-            Assert(groupController.EnableAll(5, 1).Ok && groupIds.All(groupScheduler.IsArmed), "all-enable arms all four mapped joints");
-            Assert(groupFrames.Count == 4 && groupFrames.Select(f => (int)(f.Id - 0x100)).SequenceEqual(groupIds), "all-enable only sends to mapped joints");
-            foreach (int id in groupIds) Assert(groupScheduler.GetTarget(id) == groupCan.Positions[id], "all-enable holds each feedback position");
-            Assert(groupController.EnableAll(5, 1).Ok && groupFrames.Count == 4, "repeated all-enable skips armed joints without resending");
-            groupController.EmergencyStop(); groupCan.FailSend = true;
-            Assert(!groupController.EnableAll(5, 1).Ok && groupIds.All(id => !groupScheduler.IsArmed(id)), "all-enable send failure leaves no armed trajectories");
+            Assert(!headController.MoveToJointPosition(1, -41, 5, 1).Ok &&
+                !headController.MoveJointIncrement(2, -1, 5, 1).Ok, "head positioning and jog both enforce head limits");
+            Assert(headController.TryAcquireWholeBody() && headScheduler.IsArmed(1) && headScheduler.IsArmed(2) &&
+                !headController.Enable(3, 5, 1).Ok, "CSP acquisition owns waist axes and preserves both head holds");
+            Assert(headController.MoveToJointPosition(2, 37, 5, 1).Ok &&
+                Od.RawToAngle(headScheduler.GetTarget(2)!.Value) <= 37,
+                "head yaw remains usable with waist CSP and rounds the upper limit inward");
+            headController.ReleaseWholeBody();
+            registry.GetMotor(5).HeadLimits = new HeadAngleRange(-37, 0);
+            Assert(!headController.MoveJointIncrement(1, .5, 5, 1).Ok &&
+                headController.MoveJointIncrement(1, -.5, 5, 1).Ok,
+                "a head joint at 0 degrees can only jog inward when calibrated to -37 to 0");
+            foreach (int id in new[] { 1, 2 })
+            {
+                Assert(headController.StopMotion(id).Ok, "head zero requires a stationary target");
+                headCan.SdoRequests.Clear();
+                var headZero = await headController.SetZeroOriginAsync(id, 5, 1);
+                Assert(headZero.Ok && !headScheduler.IsArmed(id) &&
+                    headCan.SdoRequests.Count == 2 &&
+                    headCan.SdoRequests.All(frame => frame.Id == Od.SdoReqBase + (uint)id &&
+                        frame.Data[1] == (Od.ZeroSet & 0xff) && frame.Data[2] == (Od.ZeroSet >> 8)) &&
+                    headCan.SdoRequests.Select(frame => frame.ReadLe32(4)).SequenceEqual(new[] { 1, 0 }),
+                    "head joint uses the same write-1, disable, write-0 and feedback check as the waist");
+            }
+
+            string jointLimitsPath = Path.Combine(temp, "joint-limits.json");
+            var jointLimitsStore = new CalibrationStore(jointLimitsPath);
+            jointLimitsStore.Save(new Calibration
+            {
+                Motors = [new(1, -37, 0), new(2, 1, 15), new(3, -10, 143), new(4, -54, 10)],
+            });
+            var limitCan = new FakeCan();
+            var limitScheduler = new KeepaliveScheduler(limitCan.Send);
+            var limitedController = new MotorController(limitCan, limitScheduler, registry, jointLimitsStore);
+            Assert(limitedController.Enable(3, 5, 1).Ok && limitedController.Enable(4, 5, 1).Ok,
+                "calibrated waist joints can hold current positions");
+            await Task.Delay(160);
+            Assert(!limitedController.MoveToJointPosition(3, 1, 5, 1).Ok &&
+                !limitedController.MoveJointIncrement(3, .5, 5, 1).Ok &&
+                !limitedController.MoveToPosition(4, 0, 5, 1).Ok && limitScheduler.GetTarget(3) == 0,
+                "waist bounds block absolute, incremental and single-axis zero targets outside calibration");
+            Assert(limitedController.MoveToJointPosition(3, -37, 5, 1).Ok &&
+                Od.RawToAngle(limitScheduler.GetTarget(3)!.Value) <= 37,
+                "reversed waist motor can reach the inward-quantized negative joint limit");
+            File.Delete(jointLimitsPath);
 
             var receive = new CanFdTransport();
             var process = typeof(CanFdTransport).GetMethod("ProcessFrame", BindingFlags.Instance | BindingFlags.NonPublic)!;
             void Inject(uint id, byte length, byte[] data) => process.Invoke(receive, new object[] { id, length, data });
+            receive.ConfigureFirmware117(registry.Motors.Select(m => m.DeviceId));
+            byte[] r48Feedback = [0x09, 0xE1, 0xFD, 0xE5, 0xFF, 0x51, 0, 0, 0, 0xF0, 1, 0xC0];
+            Inject(0x301, 12, r48Feedback);
+            Inject(0x302, 12, r48Feedback);
+            Assert(new[] { 1, 2 }.All(id => receive.IsDeviceAlive(id) &&
+                receive.GetFeedback(id) is { IsFirmware117: true, Enabled: true, BrakeReleased: true,
+                    PositionRaw: 0x09E1, VelocityRpm: -539, CurrentMa: -175, TemperatureRaw: 240 }),
+                "R48 manual example decodes correctly for both head CAN IDs");
             Inject(0x303, 12, new byte[12]);
             Assert(receive.GetFeedback(3) != null, "transport accepts new layout");
             Inject(0x303, 16, new byte[16]);
@@ -437,9 +496,12 @@ internal static class Program
             Equals(angleText.Invoke(null, [feedback, -1]), $"{-90d:F2}°") &&
             Equals(angleText.Invoke(null, [feedback, 1]), $"{90d:F2}°"), "motor cards show signed feedback in degrees, or a dash when offline");
         var onClick = typeof(System.Windows.Forms.Control).GetMethod("OnClick", flags)!;
+        var displayOrder = new[] { 4, 5, 0, 1, 2, 3 };
         for (int i = 0; i < cards.Length; i++)
         {
             var card = (System.Windows.Forms.Control)cards.GetValue(i)!;
+            int displayIndex = Array.IndexOf(displayOrder, i);
+            Assert(((TableLayoutPanel)card.Parent!).GetRow(card) == displayIndex, "head cards precede the waist cards");
             var row = card.Controls.OfType<FlowLayoutPanel>().Single();
             var header = card.Controls.OfType<TableLayoutPanel>().Single();
             var idInput = row.Controls.OfType<NumericUpDown>().Single();
@@ -448,13 +510,13 @@ internal static class Program
             var areas = new[] { card, row, header }.Concat(header.Controls.OfType<Label>()).Concat(row.Controls.OfType<Label>());
             foreach (var area in areas)
             {
-                selection.SelectedIndex = (i + 1) % cards.Length;
+                selection.SelectedIndex = (displayIndex + 1) % cards.Length;
                 onClick.Invoke(area, new object[] { EventArgs.Empty });
-                Assert(selection.SelectedIndex == i, $"card {i + 1}: {area.GetType().Name} selects matching joint");
+                Assert(selection.SelectedIndex == displayIndex, $"card {i + 1}: {area.GetType().Name} selects matching joint");
             }
             Assert(idInput.Value == originalId, "selecting card regions does not change CAN ID");
         }
-        selection.SelectedIndex = 0;
+        selection.SelectedIndex = 2;
         var navigation = (Button[])typeof(MainForm).GetField("_pageButtons", flags)!.GetValue(form)!;
         var pages = (Panel[])typeof(MainForm).GetField("_pages", flags)!.GetValue(form)!;
         var target = (NumericUpDown)typeof(MainForm).GetField("_targetAngleNum", flags)!.GetValue(form)!;
@@ -470,16 +532,16 @@ internal static class Program
                 Assert(!pages[i].IsDisposed && ((NavigationButton)navigation[i]).Selected, "page remains alive and corresponding tab stays selected");
             }
         onClick.Invoke(navigation[0], new object[] { EventArgs.Empty });
-        selection.SelectedIndex = 0;
+        selection.SelectedIndex = 2;
         string[] buttonFields = { "_enableButton", "_disableButton", "_clearErrButton", "_setZeroButton", "_moveButton", "_jogFwdButton", "_jogRevButton", "_stopMotionButton", "_returnZeroButton" };
         var buttons = buttonFields.Select(name => (Button)typeof(MainForm).GetField(name, flags)!.GetValue(form)!).ToArray();
         var ready = new OperationUiState(true, true, false, false, true, true, false, false, false, true);
-        form.ApplyOperationState(ready);
+        form.ApplyOperationState(ready, 0);
         int switches = 0;
         foreach (var b in buttons) b.EnabledChanged += (_, _) => switches++;
         for (int i = 0; i < 1000; i++)
         {
-            form.ApplyOperationState(ready with { Moving = i % 2 == 0, AtTarget = i % 3 == 0, InEnableWindow = i % 4 == 0 });
+            form.ApplyOperationState(ready with { Moving = i % 2 == 0, AtTarget = i % 3 == 0, InEnableWindow = i % 4 == 0 }, 0);
             Assert(buttons[3].Enabled && buttons[4].Enabled && buttons[5].Enabled && buttons[6].Enabled && buttons[8].Enabled, "short motion leaves control buttons visually stable");
         }
         Assert(switches == 0, "zero EnabledChanged events across 1000 simulated motion refreshes");
@@ -497,6 +559,34 @@ internal static class Program
         Assert(!buttons[4].Enabled && !buttons[5].Enabled && !buttons[8].Enabled, "lost feedback still disables motion");
         form.ApplyOperationState(ready with { Configuring = true });
         Assert(!buttons[4].Enabled && !buttons[3].Enabled, "configuration locks commands");
+        var registry = (MotorRegistry)typeof(MainForm).GetField("_registry", flags)!.GetValue(form)!;
+        registry.GetMotor(5).HeadLimits = new HeadAngleRange(-37, 0);
+        selection.SelectedIndex = 0;
+        form.ApplyOperationState(ready, 0);
+        Assert(buttons[3].Enabled, "head pitch exposes set zero under the same conditions as the waist");
+        Assert(target.Minimum == -37 && target.Maximum == 0 && target.Value == 0 &&
+            !buttons[5].Enabled && buttons[6].Enabled, "selected head range clamps absolute target and disables positive jog at zero");
+        target.UpButton();
+        Assert(target.Value == 0, "absolute input arrows stop at the calibrated limit");
+        form.ApplyOperationState(ready, -37);
+        Assert(buttons[5].Enabled && !buttons[6].Enabled, "negative jog is disabled at the lower bound");
+        var step = (NumericUpDown)typeof(MainForm).GetField("_jogStepNum", flags)!.GetValue(form)!;
+        step.Value = .5M;
+        form.ApplyOperationState(ready, -.25);
+        Assert(!buttons[5].Enabled && buttons[6].Enabled, "a step that would cross the upper bound is blocked before reaching it");
+        var speed = (NumericUpDown)typeof(MainForm).GetField("_jogSpeedNum", flags)!.GetValue(form)!;
+        var acceleration = (NumericUpDown)typeof(MainForm).GetField("_jogAccelNum", flags)!.GetValue(form)!;
+        speed.Value = 1; acceleration.Value = 5;
+        selection.SelectedIndex = 1;
+        target.Value = 30; speed.Value = 3; acceleration.Value = 8; step.Value = 2;
+        form.ApplyOperationState(ready, 0);
+        Assert(buttons[3].Enabled, "head yaw exposes set zero under the same conditions as the waist");
+        selection.SelectedIndex = 0;
+        Assert(target.Value == 0 && speed.Value == 1 && acceleration.Value == 5 && step.Value == .5M,
+            "switching from motor 2 at 30 degrees restores motor 1's own four parameters");
+        selection.SelectedIndex = 1;
+        Assert(target.Value == 30 && speed.Value == 3 && acceleration.Value == 8 && step.Value == 2,
+            "switching back restores motor 2 without clamping it to motor 1's range");
         using var label = new Label();
         int textChanges = 0, colorChanges = 0;
         label.TextChanged += (_, _) => textChanges++; label.ForeColorChanged += (_, _) => colorChanges++;
@@ -606,16 +696,20 @@ internal static class Program
             Assert(Hit(form.ClientSize.Width - 30, titleBar.Height / 2) == 1, "window action buttons remain clickable client controls");
             var selection = (ComboBox)typeof(MainForm).GetField("_motorCombo", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(form)!;
             var cards = (Array)typeof(MainForm).GetField("_motorCards", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(form)!;
+            var mapped = (Label)typeof(MainForm).GetField("_mappedIdLabel", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(form)!;
+            Assert(selection.Items.Count == 6 && Equals(selection.Items[0], "1号电机-头部点头") &&
+                Equals(selection.Items[1], "2号电机-头部摇头") && mapped.Text.Contains("头部 1、2"),
+                "communication page and joint selection expose the two default R48 IDs");
             typeof(System.Windows.Forms.Control).GetMethod("OnClick", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(cards.GetValue(2), new object[] { EventArgs.Empty });
-            Assert(selection.SelectedIndex == 2, "motor card selects matching control target");
-            selection.SelectedIndex = 0;
+            Assert(selection.SelectedIndex == 4, "motor card selects matching control target");
+            selection.SelectedIndex = 2;
             if (args.Contains("--demo"))
             {
                 var flags = BindingFlags.Instance | BindingFlags.NonPublic;
                 void Label(string name, string value) { ((Label)typeof(MainForm).GetField(name, flags)!.GetValue(form)!).Text = value; }
                 Label("_connStateLabel", "● 适配器已打开");
                 ((Label)typeof(MainForm).GetField("_connStateLabel", flags)!.GetValue(form)!).ForeColor = Color.FromArgb(68, 218, 170);
-                Label("_busIdLabel", "3, 4, 5, 6");
+                Label("_busIdLabel", "1, 2, 3, 4, 5, 6");
                 Label("_rxTxLabel", "188657 / 99437"); Label("_posLabel", "12.50°");
                 Label("_velLabel", "0 RPM"); Label("_curLabel", "−27 mA"); Label("_modeLabel", "PP 轮廓位置");
                 Label("_tempLabel", "27.5 °C"); Label("_faultLabel", "无故障");
@@ -637,8 +731,10 @@ internal static class Program
             var navigation = (Button[])typeof(MainForm).GetField("_pageButtons", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(form)!;
             var pages = (Panel[])typeof(MainForm).GetField("_pages", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(form)!;
             var emergency = (Button)typeof(MainForm).GetField("_eStopButton", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(form)!;
-            var homeAll = (Button)typeof(MainForm).GetField("_returnAllZeroButton", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(form)!;
-            Assert(emergency.Parent == homeAll.Parent && emergency.Top > homeAll.Bottom, "emergency stop is placed below all-zero on joint page");
+            var enableAll = (Button)typeof(MainForm).GetField("_enableAllButton", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(form)!;
+            Assert(enableAll.Text == "六轴使能" && emergency.Parent == enableAll.Parent && emergency.Top > enableAll.Bottom &&
+                !enableAll.Parent!.Controls.OfType<Button>().Any(button => button.Text.Contains("四轴回零")),
+                "joint page offers six-axis enable and emergency stop with no group zero button");
             for (int pageIndex = 0; pageIndex < pages.Length; pageIndex++)
             {
                 if (pageIndex == 0)
@@ -674,6 +770,17 @@ internal static class Program
                 Assert(!transition.Visible, "page transition finishes and releases input overlay");
                 Assert(navigation.All(b => b.Bounds.Y == navigation[0].Top && b.Height == navigation[0].Height), "navigation buttons stay aligned and equal height after selection");
                 Assert(pages[pageIndex].Visible, "selecting a button leaves selected content visible");
+                if (pageIndex == 3)
+                {
+                    var calibration = pages[3].Controls.OfType<waist_motor_controller.WholeBody.CalibrationPage>().Single();
+                    var headSave = calibration.Controls.OfType<TableLayoutPanel>().Single()
+                        .Controls.OfType<Button>().Single(button => button.Text == "保存头部角度范围");
+                    calibration.ScrollControlIntoView(headSave);
+                    Application.DoEvents();
+                    var saveBounds = calibration.RectangleToClient(headSave.RectangleToScreen(headSave.ClientRectangle));
+                    Assert(calibration.ClientRectangle.Contains(saveBounds),
+                        "head calibration controls can scroll into view");
+                }
                 using var image = new Bitmap(form.ClientSize.Width, form.ClientSize.Height);
                 form.DrawToBitmap(image, new Rectangle(Point.Empty, image.Size));
                 string prefix = args.Contains("--demo") ? "ui-preview" : "ui-offline";
@@ -869,7 +976,26 @@ internal static class Program
         public event Action<int, MotorFeedback>? FeedbackUpdated { add { } remove { } }
         public List<CanFrame> SdoRequests = new();
         public TaskCompletionSource<SdoResponse?>? Pending;
-        public bool Send(CanFrame f) => !FailSend;
+        public readonly List<CanFrame> SentFrames = new();
+        public readonly List<CanFrame[]> Batches = new();
+        public int BatchLimit = int.MaxValue;
+        public bool Send(CanFrame f)
+        {
+            if (FailSend) return false;
+            SentFrames.Add(f);
+            return true;
+        }
+        public int SendBatch(IReadOnlyList<CanFrame> frames)
+        {
+            Batches.Add(frames.ToArray());
+            int sent = 0;
+            foreach (var frame in frames.Take(BatchLimit))
+            {
+                if (!Send(frame)) break;
+                sent++;
+            }
+            return sent;
+        }
         public MotorFeedback GetFeedback(int id) => new()
         {
             DeviceId = id, PositionRaw = Positions.GetValueOrDefault(id), Enabled = true, BrakeReleased = true, Mode = 1,

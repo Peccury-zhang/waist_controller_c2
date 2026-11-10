@@ -129,9 +129,10 @@ public sealed class RobotView : System.Windows.Forms.UserControl
 
     void UpdateCamera() { var p=new Point3D(distance*Math.Cos(elevation)*Math.Cos(azimuth),distance*Math.Cos(elevation)*Math.Sin(azimuth),0.65+distance*Math.Sin(elevation)); camera.Position=p; camera.LookDirection=new Point3D(0,0,0.65)-p; }
     static Material Material(float r,float g,float b,float a) { var m=new DiffuseMaterial(new SolidColorBrush(Color.FromScRgb(a,r,g,b))); m.Freeze(); return m; }
-    public void UpdatePose(double[] actual,double[]? target,bool stale)
+    public void UpdatePose(double[] actual,double[]? target,bool stale, IReadOnlyDictionary<string, double>? headAngles = null)
     {
-        var fk=robot.Forward(actual); var goal=target==null ? null : robot.Forward(target);
+        var fk = robot.Forward(actual, headAngles);
+        var goal = target == null ? null : robot.Forward(target, headAngles);
         foreach(var p in parts)
         {
             p.Actual.Transform=Transform(p.Visual,fk[p.Visual.Link]);

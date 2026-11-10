@@ -57,15 +57,14 @@ public sealed class KeepaliveScheduler
         }
     }
     public void Hold(int id) { lock (_gate) if (_axes[id] is { } axis) axis.Hold(axis.CommandRaw); }
-    public bool MoveGroup(IReadOnlyList<int> ids, short target, double speed, double accel)
+    internal bool ArmGroupHold(IReadOnlyList<(int Id, short Position)> targets, Func<IReadOnlyList<CanFrame>, int> sendBatch)
     {
         lock (_gate)
         {
-            // Validate everything before changing a trajectory; Tick cannot observe a partly started group.
-            new PositionTrajectory(0).Move(target, speed, accel);
-            if (ids.Count == 0 || ids.Distinct().Count() != ids.Count ||
-                ids.Any(id => id is < 1 or > 127 || _axes[id] == null || _axes[id]!.IsMoving)) return false;
-            foreach (int id in ids) _axes[id]!.Move(target, speed, accel);
+            var frames = targets.Select(target => Build(target.Id, PdoCommand.Hold(target.Position))).ToArray();
+            if (sendBatch(frames) != frames.Length) return false;
+            foreach (var (id, position) in targets)
+                _axes[id] = new PositionTrajectory(position);
             return true;
         }
     }

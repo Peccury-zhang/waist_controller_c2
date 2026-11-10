@@ -168,8 +168,8 @@ public sealed class WholeBodyController : IDisposable
             if(state==GroupState.FaultLatched)throw new InvalidOperationException("故障锁存，请先退出 CSP 后重新检查");
             if(owns)throw new InvalidOperationException("已占用四轴");
             calibration.Validate(robot);
-            ids=registry.Motors.Select(m=>m.DeviceId).ToArray();
-            if(registry.Motors.Any(m=>!m.UseFirmware117Pdo))throw new InvalidOperationException("请使用V1.17自定义PDO协议");
+            ids=registry.WaistMotors.Select(m=>m.DeviceId).ToArray();
+            if(registry.WaistMotors.Any(m=>!m.UseFirmware117Pdo))throw new InvalidOperationException("请使用V1.17自定义PDO协议");
             var fb = Feedback(100, preflight: true);
             calibration.CheckWholeBodyStart(fb.Select((axis, i) => calibration.ToJoint(i, axis.PositionRaw)).ToArray());
             if(!legacy.TryAcquireWholeBody())throw new InvalidOperationException("请先结束关节页的运动或标定操作");

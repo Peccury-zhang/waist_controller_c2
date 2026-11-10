@@ -1,15 +1,19 @@
 using waist_motor_controller.Can;
 using waist_motor_controller.Protocol;
+using WaistModel;
 
 namespace waist_motor_controller.Control;
 
-/// <summary>只控制注册的四个节点；确认协议分支用PP报文接收主机生成的轨迹目标。</summary>
+/// <summary>只控制注册节点；用 PP 报文发送主机生成的关节轨迹目标。</summary>
 public sealed class MotorController
 {
     private readonly object _gate = new();
     private readonly ICanTransport _transport;
     private readonly KeepaliveScheduler _keepalive;
     private readonly MotorRegistry _registry;
+    private readonly CalibrationStore _calibrationStore;
+    private Calibration? _waistCalibration;
+    private bool _waistCalibrationInvalid;
     private readonly long[] _enabledSince = new long[128];
     private readonly bool[] _calibrating = new bool[128];
     private int _generation;
@@ -20,8 +24,11 @@ public sealed class MotorController
     {
         lock (_gate)
         {
-            if (_wholeBodyOwned || _calibrating.Any(x => x) || _registry.Motors.Any(m => _keepalive.IsMoving(m.DeviceId) || (_keepalive.IsArmed(m.DeviceId) && !IsAtTarget(m.DeviceId)))) return false;
-            _keepalive.DisarmAll();
+            if (_wholeBodyOwned || _calibrating.Any(active => active) || !_registry.HasUniqueDeviceIds) return false;
+            var waistIds = _registry.WaistMotors.Select(m => m.DeviceId).ToArray();
+            if (waistIds.Any(id => _keepalive.IsMoving(id) ||
+                (_keepalive.IsArmed(id) && !IsAtTarget(id)))) return false;
+            foreach (int id in waistIds) _keepalive.Disarm(id);
             _wholeBodyOwned = true; return true;
         }
     }
@@ -29,9 +36,12 @@ public sealed class MotorController
 
     public event Action<string>? Log;
 
-    public MotorController(ICanTransport transport, KeepaliveScheduler keepalive, MotorRegistry registry)
+    public MotorController(ICanTransport transport, KeepaliveScheduler keepalive, MotorRegistry registry,
+        CalibrationStore? calibrationStore = null)
     {
         _transport = transport; _keepalive = keepalive; _registry = registry;
+        _calibrationStore = calibrationStore ?? new CalibrationStore();
+        ReloadJointLimits();
         _transport.FeedbackUpdated += (id, fb) =>
         {
             if (Configured(id) && (fb.HasError || fb.FaultCode != 0) && _keepalive.IsArmed(id))
@@ -43,7 +53,38 @@ public sealed class MotorController
         _keepalive.AxisStopped += (id, reason) => Log?.Invoke($"电机 {id}：{reason}");
     }
     private bool Configured(int id) => _registry.Motors.Any(m => m.DeviceId == id);
+    private bool OwnedByWholeBody(int id) => _wholeBodyOwned && _registry.WaistMotors.Any(m => m.DeviceId == id);
     private int Direction(int id) => _registry.Motors.FirstOrDefault(m => m.DeviceId == id)?.Direction ?? 1;
+
+    internal void ReloadJointLimits()
+    {
+        lock (_gate)
+        {
+            _waistCalibration = null;
+            _waistCalibrationInvalid = false;
+            if (!File.Exists(_calibrationStore.FilePath)) return;
+            try { _waistCalibration = _calibrationStore.Load(_registry.WaistMotors.Select(m => m.Direction).ToArray()); }
+            catch (Exception e) when (e is IOException or InvalidDataException or UnauthorizedAccessException or System.Text.Json.JsonException)
+            {
+                _waistCalibrationInvalid = true;
+            }
+        }
+    }
+
+    internal (double Minimum, double Maximum)? GetJointLimits(MotorConfig motor)
+    {
+        lock (_gate)
+        {
+            if (motor.IsHead)
+                return motor.HeadLimits is { } head ? (head.Minimum, head.Maximum) : null;
+            if (_waistCalibrationInvalid) return null;
+            var limit = _waistCalibration?.Motors.Single(m => m.LogicalId == motor.LogicalId);
+            return limit is null ? (Od.MinAngle, Od.MaxAngle) : (limit.MinAngleDeg, limit.MaxAngleDeg);
+        }
+    }
+
+    internal static bool InJointRange((double Minimum, double Maximum)? limits, double angle) =>
+        limits is { } range && angle >= range.Minimum && angle <= range.Maximum;
 
     internal (bool Ok, string Message) MoveToJointPosition(int id, double targetDeg, double accel, double speed) =>
         MoveToPosition(id, Direction(id) * targetDeg, accel, speed);
@@ -54,10 +95,13 @@ public sealed class MotorController
     public bool IsBusy(int id) { lock (_gate) return _calibrating[id]; }
     public bool IsWithinEnableWindow(int id) => _enabledSince[id] != 0 &&
         Environment.TickCount64 - _enabledSince[id] < 150;
-    private string? Check(int id, bool motion = false)
+    private string? Check(int id, bool motion = false) => Check(id, out _, motion);
+
+    private string? Check(int id, out MotorFeedback? feedback, bool motion = false)
     {
-        if (_wholeBodyOwned) return "全身运控占用四轴，请先退出 CSP";
-        if (!Configured(id)) return "只允许控制已保存映射的四个电机";
+        feedback = null;
+        if (OwnedByWholeBody(id)) return "全身运控占用腰部四轴，请先退出 CSP";
+        if (!Configured(id)) return "只允许控制已保存映射的电机";
         if (!_transport.IsOpen || !_transport.IsDeviceAlive(id)) return $"电机 {id} 无新鲜反馈（500ms）";
         if (_calibrating[id]) return "标零处理中";
         var fb = _transport.GetFeedback(id);
@@ -65,6 +109,7 @@ public sealed class MotorController
         if (fb.HasError || fb.FaultCode != 0) return FaultCodes.Describe(fb.FaultCode);
         if (motion && (!fb.Enabled || !fb.BrakeReleased || !_keepalive.IsArmed(id))) return "请先通过本程序使能电机";
         if (motion && IsWithinEnableWindow(id)) return "使能后请等待150ms再运动";
+        feedback = fb;
         return null;
     }
     public (bool Ok, string Message) Enable(int id, double accel, double speed)
@@ -81,29 +126,29 @@ public sealed class MotorController
             return (true, "保持当前位置，使能帧已发送");
         }
     }
-    public (bool Ok, string Message) EnableAll(double accel, double speed)
+    public (bool Ok, string Message) EnableAll()
     {
         lock (_gate)
         {
-            int[] ids = _registry.Motors.Select(m => m.DeviceId).ToArray();
-            foreach (int id in ids)
-                if (Check(id) is { } error) return (false, $"ID {id}：{error}；未执行全部使能");
-            var enabled = new List<int>();
-            var skipped = new List<int>();
-            foreach (int id in ids)
+            if (!_registry.HasUniqueDeviceIds) return (false, "CAN ID 重复，无法执行六轴使能");
+            var targets = new List<(int Id, short Position)>();
+            foreach (var motor in _registry.Motors)
             {
-                if (_keepalive.IsArmed(id)) { skipped.Add(id); continue; }
-                var result = Enable(id, accel, speed);
-                if (!result.Ok)
-                {
-                    var stop = EmergencyStop();
-                    return (false, $"ID {id} 使能失败：{result.Message}；已撤销全部使能。{stop.Message}");
-                }
-                enabled.Add(id);
+                int id = motor.DeviceId;
+                if (Check(id, out var feedback) is { } error) return (false, $"ID {id}：{error}；未执行六轴使能");
+                if (!_keepalive.IsArmed(id))
+                    targets.Add((id, feedback!.PositionRaw));
             }
-            string message = enabled.Count == 0 ? "四个关节均已通过本程序使能" :
-                $"ID {string.Join(", ", enabled)} 使能帧已发送，保持各自当前位置";
-            if (skipped.Count > 0) message += $"；跳过已使能 ID {string.Join(", ", skipped)}";
+            if (targets.Count == 0) return (true, "六轴均已通过本程序使能");
+
+            long enabledAt = Environment.TickCount64;
+            foreach (var (id, _) in targets) _enabledSince[id] = enabledAt;
+            if (!_keepalive.ArmGroupHold(targets, _transport.SendBatch))
+            {
+                var stop = EmergencyStop();
+                return (false, $"六轴使能批次发送不完整，已撤销本程序的使能状态。{stop.Message}");
+            }
+            string message = $"ID {string.Join(", ", targets.Select(target => target.Id))} 的使能帧已批量发送，保持各自当前位置";
             Log?.Invoke(message);
             return (true, message);
         }
@@ -112,7 +157,7 @@ public sealed class MotorController
     {
         lock (_gate)
         {
-            if (_wholeBodyOwned) return (false, "全身运控占用四轴，请先退出 CSP");
+            if (OwnedByWholeBody(id)) return (false, "全身运控占用腰部四轴，请先退出 CSP");
             if (!Configured(id)) return (false, "节点未配置");
             ++_generation;
             _enabledSince[id] = 0;
@@ -124,7 +169,7 @@ public sealed class MotorController
     {
         lock (_gate)
         {
-            if (_wholeBodyOwned) return (false, "全身运控占用四轴，请先退出 CSP");
+            if (OwnedByWholeBody(id)) return (false, "全身运控占用腰部四轴，请先退出 CSP");
             if (!Configured(id) || _calibrating[id]) return (false, "节点未配置或正在标零");
             var fb = _transport.GetFeedback(id);
             if (fb != null && fb.FaultCode != 0)
@@ -150,37 +195,20 @@ public sealed class MotorController
             if (_keepalive.IsMoving(id)) return (false, "正在运动，请等待或先停止");
             try
             {
-                if (!_keepalive.Move(id, Od.AngleToRaw(targetDeg), speed, accel)) return (false, "未使能或正在运动");
+                var motor = _registry.Motors.First(m => m.DeviceId == id);
+                if (GetJointLimits(motor) is not { } range)
+                    return (false, "未取得有效的关节角度范围，请检查标定设备");
+                if (!InJointRange(range, targetDeg * motor.Direction))
+                    return (false, $"{motor.Name}目标超出标定范围 {range.Minimum}～{range.Maximum}°");
+                double a = range.Minimum * motor.Direction * Od.CountsPerDeg;
+                double b = range.Maximum * motor.Direction * Od.CountsPerDeg;
+                short raw = (short)Math.Clamp(Od.AngleToRaw(targetDeg),
+                    (int)Math.Ceiling(Math.Min(a, b)), (int)Math.Floor(Math.Max(a, b)));
+                if (!_keepalive.Move(id, raw, speed, accel)) return (false, "未使能或正在运动");
             }
             catch (ArgumentOutOfRangeException ex) { return (false, ex.Message); }
             Log?.Invoke($"电机 {id} 定位 → {targetDeg:F3}°（电机角），输出端速度 {speed:F2}rpm，加速度 {accel:F2}rpm/s");
             return (true, "位置轨迹已启动");
-        }
-    }
-    public (bool Ok, string Message) ReturnAllToZero(double accel, double speed)
-    {
-        lock (_gate)
-        {
-            if (_wholeBodyOwned) return (false, "请在全身运控页点击“停止并退出 CSP”，等待退出后再使能回零");
-            int[] configured = _registry.Motors.Select(m => m.DeviceId).ToArray();
-            int[] ids = configured.Where(id => _keepalive.IsArmed(id) && _transport.GetFeedback(id)?.Enabled != false).ToArray();
-            int[] skipped = configured.Except(ids).ToArray();
-            string skippedMessage = skipped.Length == 0 ? "" : $"；跳过未使能关节 ID {string.Join(", ", skipped)}";
-            if (ids.Length == 0) return (false, "没有通过本程序使能的关节，未发送回零指令" + skippedMessage);
-            foreach (int id in ids)
-            {
-                if (Check(id, motion: true) is { } error) return (false, $"ID {id}：{error}；未启动全部回零");
-                if (_keepalive.IsMoving(id)) return (false, $"ID {id} 正在运动，请先停止或等待完成；未启动全部回零");
-            }
-            try
-            {
-                if (!_keepalive.MoveGroup(ids, 0, speed, accel))
-                    return (false, "关节状态已变化，请检查使能及运动状态；未启动全部回零");
-            }
-            catch (ArgumentOutOfRangeException ex) { return (false, ex.Message); }
-            string message = $"关节 ID {string.Join(", ", ids)} 的 0° 位置轨迹已启动，速度 {speed:F2}rpm，加速度 {accel:F2}rpm/s" + skippedMessage;
-            Log?.Invoke(message);
-            return (true, message);
         }
     }
     public (bool Ok, string Message) MoveIncrement(int id, double deltaDeg, double accel, double speed)
@@ -201,7 +229,7 @@ public sealed class MotorController
     {
         lock (_gate)
         {
-            if (_wholeBodyOwned) return (false, "全身运控占用四轴，请先退出 CSP");
+            if (OwnedByWholeBody(id)) return (false, "全身运控占用腰部四轴，请先退出 CSP");
             if (!Configured(id)) return (false, "节点未配置");
             _keepalive.Hold(id);
             Log?.Invoke($"电机 {id} 已停止轨迹，保持最后指令位置");
@@ -284,7 +312,7 @@ public sealed class MotorController
                 _enabledSince[m.DeviceId] = 0;
                 ok &= _keepalive.SendDisabled(m.DeviceId);
             }
-            string message = ok ? "四个已配置电机的失能抱闸帧已发送" : "部分失能帧发送失败，请检查硬件急停和CAN连接";
+            string message = ok ? "已配置电机的失能抱闸帧已发送" : "部分失能帧发送失败，请检查硬件急停和CAN连接";
             Log?.Invoke(message);
             return (ok, message);
         }
@@ -306,7 +334,7 @@ public sealed class MotorController
         }
         try
         {
-            // 探测包括未纳入控制的另外两台电机；无响应仍需现场确认ID未被占用。
+            // 探测未映射节点；无响应仍需现场确认 ID 未被占用。
             var probe = await _transport.SdoRequestAsync(newId, SdoMessage.Read(newId, Od.ActualPosition, 0), 100).ConfigureAwait(false);
             Task<SdoResponse?> write;
             lock (_gate)

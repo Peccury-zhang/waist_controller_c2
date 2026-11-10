@@ -34,6 +34,7 @@ public sealed class WholeBodyPage:UserControl
     private Label heightTitle = null!;
     private Label frontTitle = null!;
     bool planning, exiting;double[] measured=new double[4];double[]? goal;string? signature;
+    private readonly Dictionary<string, double> headAngles = new();
     public bool Busy=>planning||controller.State is GroupState.Arming or GroupState.Executing or GroupState.Stopping or GroupState.Settling or GroupState.Disarming;
     internal bool PollsFeedback => controller.PollsFeedback;
     public WholeBodyPage(ICanTransport bus,MotorRegistry registry,MotorController legacy,Func<IReadOnlyDictionary<int,string>> firmware,
@@ -310,12 +311,12 @@ public sealed class WholeBodyPage:UserControl
         GroupState.Disarming => "正在退出 CSP",
         _ => "故障",
     };
-    int[] Signs()=>registry.Motors.Select(m=>m.Direction).ToArray();
+    int[] Signs()=>registry.WaistMotors.Select(m=>m.Direction).ToArray();
     private MotorFeedback[] ReadMotorFeedback()
     {
         const string unavailable = "请连接设备并等待四轴有效反馈";
         if (!bus.IsOpen) throw new InvalidOperationException(unavailable);
-        var feedback = registry.Motors.Select(m => bus.GetFeedback(m.DeviceId) ?? throw new InvalidOperationException(unavailable)).ToArray();
+        var feedback = registry.WaistMotors.Select(m => bus.GetFeedback(m.DeviceId) ?? throw new InvalidOperationException(unavailable)).ToArray();
         long now = MotorFeedback.Now;
         if (feedback.Any(axis => now - axis.Timestamp > 100 || axis.Timestamp > now || axis.HasError || axis.FaultCode != 0))
             throw new InvalidOperationException(unavailable);
@@ -324,6 +325,18 @@ public sealed class WholeBodyPage:UserControl
     private static double[] ToUrdfJoints(MotorFeedback[] feedback, int[] signs) =>
         feedback.Select((axis, i) => Calibration.FeedbackToUrdf(i, axis.PositionRaw, signs[i])).ToArray();
     private double[] ReadFeedback() => ToUrdfJoints(ReadMotorFeedback(), Signs());
+
+    private void RefreshHeadAngles()
+    {
+        if (!bus.IsOpen) return;
+        foreach (var motor in registry.HeadMotors)
+        {
+            if (motor.HeadJoint is not { } joint || bus.GetFeedback(motor.DeviceId) is not { } feedback) continue;
+            long age = MotorFeedback.Now - feedback.Timestamp;
+            if (age is >= 0 and <= 100)
+                headAngles[joint] = motor.Direction * feedback.PositionDeg * Math.PI / 180;
+        }
+    }
     static double[] Values(TaskPose p)=>[p.Z*1000,p.X*1000,p.Pitch*180/Math.PI,p.Yaw*180/Math.PI];
     void Fill(TaskPose pose)
     {
@@ -612,8 +625,9 @@ public sealed class WholeBodyPage:UserControl
         parkingRecoveryButton.Enabled = calibrated && controller.CanRecoverParking;
         for (int i = 0; i < target.Length; i++) target[i].Enabled = ready && (i != 2 || !keepPitch.Checked);
         keepPitch.Enabled = !Busy;
+        RefreshHeadAngles();
         view.UpdateJointFeedback(anglesDeg);
-        try{view.UpdatePose(measured,goal,stale);}catch(Exception e){controller.Stop();hint.Text=e.Message;}
+        try{view.UpdatePose(measured,goal,stale,headAngles);}catch(Exception e){controller.Stop();hint.Text=e.Message;}
         bool showParking = parked && state == GroupState.Holding;
         if (state == GroupState.FaultLatched || (exiting && state != GroupState.Observing) ||
             (!planning && (stoppedBeforeTarget || showParking || (showingParkingStatus && state == GroupState.Holding))))

@@ -78,10 +78,16 @@ public sealed class Robot
         for (int i=0;i<4;i++) if (!double.IsFinite(q[i]) || q[i] < axes[i].Lower || q[i] > axes[i].Upper)
             throw new ArgumentOutOfRangeException(axes[i].Name,$"逻辑轴 {i+1} 目标 {q[i]:F6} rad 超出 URDF [{axes[i].Lower}, {axes[i].Upper}]");
     }
-    public Dictionary<string,Matrix4x4> Forward(double[] q)
+    public Dictionary<string,Matrix4x4> Forward(double[] q, IReadOnlyDictionary<string, double>? extraJointAngles = null)
     {
         var result = new Dictionary<string,Matrix4x4> { ["base_link"] = Matrix4x4.Identity };
-        foreach (var j in Joints) { int i = Array.IndexOf(AxisNames,j.Name); var motion = j.Type == "fixed" ? Matrix4x4.Identity : Matrix4x4.CreateFromAxisAngle(j.Axis,(float)(i < 0 ? 0 : q[i])); result[j.Child] = motion * j.Origin * result[j.Parent]; }
+        foreach (var j in Joints)
+        {
+            int i = Array.IndexOf(AxisNames, j.Name);
+            double angle = i >= 0 ? q[i] : extraJointAngles?.GetValueOrDefault(j.Name) ?? 0;
+            var motion = j.Type == "fixed" ? Matrix4x4.Identity : Matrix4x4.CreateFromAxisAngle(j.Axis, (float)angle);
+            result[j.Child] = motion * j.Origin * result[j.Parent];
+        }
         return result;
     }
 }

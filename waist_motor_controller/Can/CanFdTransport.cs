@@ -298,7 +298,8 @@ public sealed class CanFdTransport : IDisposable, ICanTransport
 
     public int SendBatch(IReadOnlyList<CanFrame> frames)
     {
-        if (frames.Count == 0 || frames.Count > 4 || frames.Any(f => !f.IsFd)) throw new ArgumentException("Only 1-4 FD frames allowed");
+        if (frames.Count is < 1 or > 6 || frames.Any(f => !f.IsFd))
+            throw new ArgumentException("Only 1-6 FD frames allowed", nameof(frames));
         lock (_sendGate)
         {
             if (!IsOpen) return 0;
